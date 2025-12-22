@@ -40,7 +40,8 @@ env/
 # Data files (large)
 data/raw/*.json
 data/synthetic/*.json
-!data/synthetic/.gitkeep
+data/code_search/*.json
+!data/*/.gitkeep
 
 # Model outputs
 outputs/

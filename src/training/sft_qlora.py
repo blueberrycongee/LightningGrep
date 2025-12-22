@@ -201,6 +201,7 @@ def main():
     # 其他
     parser.add_argument("--mask_info", action="store_true", help="是否 mask <information> 标签")
     parser.add_argument("--dry_run", action="store_true", help="只打印配置，不训练")
+    parser.add_argument("--resume", action="store_true", help="从最新 checkpoint 断点续训")
     
     args = parser.parse_args()
     
@@ -313,10 +314,15 @@ def main():
         warmup_ratio=0.1,
         logging_steps=10,
         save_strategy="epoch",
-        evaluation_strategy="epoch" if val_dataset else "no",
+        eval_strategy="epoch" if val_dataset else "no",
+        save_total_limit=3,  # 最多保留 3 个 checkpoint
+        load_best_model_at_end=True if val_dataset else False,  # 加载最好的模型
+        metric_for_best_model="eval_loss",  # 用 eval_loss 判断
+        greater_is_better=False,  # loss 越小越好
         bf16=True,
         optim="paged_adamw_8bit",
-        report_to="none",
+        report_to="tensorboard",
+        logging_dir=f"{args.output_dir}/logs",
         remove_unused_columns=False,
     )
     
@@ -337,7 +343,19 @@ def main():
     )
     
     # 训练
-    trainer.train()
+    if args.resume:
+        import os
+        checkpoints = [d for d in os.listdir(args.output_dir) if d.startswith("checkpoint-")] if os.path.exists(args.output_dir) else []
+        if checkpoints:
+            latest = max(checkpoints, key=lambda x: int(x.split("-")[1]))
+            resume_path = os.path.join(args.output_dir, latest)
+            print(f"[续训] 从 {resume_path} 恢复")
+            trainer.train(resume_from_checkpoint=resume_path)
+        else:
+            print("[续训] 未找到 checkpoint，从头开始")
+            trainer.train()
+    else:
+        trainer.train()
     
     # 保存
     print("\n[保存模型...]")

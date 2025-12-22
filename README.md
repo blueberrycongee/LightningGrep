@@ -1,45 +1,51 @@
 # LightningGrep ⚡
 
-> **首个开源的并行检索小模型**
+> **开源的代码检索 Agent 模型**
 >
-> The First Open-Source Parallel Retrieval Model for Small LLMs
+> Open-Source Code Retrieval Agent - Replicating Windsurf's Fast Context
 
 ## 🎯 项目简介
 
-LightningGrep 是一个开源的**并行检索工具模型**，作为大模型的专精检索助手：
+LightningGrep 是一个开源的**代码检索 Agent**，复刻 Windsurf 的 Fast Context 功能：
 
-- **并行搜索**：一次发出多个独立查询，减少交互轮数
-- **智能判断**：识别何时可以并行，何时必须串行
-- **精准定位**：返回相关文档 + 行号，不是直接回答问题
-- **轻量高效**：1.7B 小模型，可本地部署
+- **并行工具调用**：一次调用多个 grep/read/glob，减少搜索轮数
+- **标准 FC 格式**：使用 Qwen 标准 Function Calling 格式训练
+- **多轮搜索**：3-4 轮搜索，每轮 5-8 个并行工具调用
+- **精准定位**：返回相关文件 + 行号范围
 
 ### 定位
 
 ```
-大模型（规划推理）──调用──→ LightningGrep（专精检索）──返回──→ 相关文档位置
-                              ↑
-                         我们做的是这个
+用户查询 ──→ LightningGrep Agent ──→ grep/read/glob 工具 ──→ 相关代码位置
+                   │
+                   ├── Round 1: 并行 grep 搜索关键词
+                   ├── Round 2: 并行 read 读取文件
+                   └── Round 3: 确认并返回结果
 ```
 
-### 核心能力
+### 示例输出
 
+```json
+Query: "Find where ParseError is raised"
+
+Round 1 (5 parallel calls):
+├── grep "raise ParseError" src/
+├── grep "ParseError(" src/
+├── grep "class ParseError" src/
+├── glob "src/*parser*.py"
+└── glob "src/*error*.py"
+
+Round 2 (4 parallel calls):
+├── read src/parser/json.py:130-150
+├── read src/parser/xml.py:75-95
+├── read src/error.py:10-30
+└── grep "except ParseError" src/
+
+Final Result:
+├── src/parser/json.py [140-144] - high
+├── src/parser/xml.py [85-87] - high
+└── src/error.py [12-15] - medium
 ```
-查询：找到两个杂志的创办时间信息
-
-模型输出：
-<think>两个杂志独立，可以并行查询</think>
-<search>A杂志创办时间 ## B杂志创办时间</search>  ← 并行搜索
-
-[环境返回搜索结果]
-
-<think>找到相关文档</think>
-<result>
-  - Arthur's Magazine: lines [0]
-  - First for Women: lines [1]
-</result>
-```
-
-**注意**：我们返回的是文档位置，不是答案。大模型拿到位置后自己推理。
 
 ## 🚀 快速开始
 
@@ -49,52 +55,68 @@ LightningGrep 是一个开源的**并行检索工具模型**，作为大模型�
 pip install -r requirements.txt
 ```
 
-### 2. 下载数据
+### 2. 合成训练数据
+
+使用 DeepSeek-V3 通过硅基流动 API 合成代码检索轨迹数据：
 
 ```bash
-python scripts/download_data.py
+# 设置 API Key
+export SILICONFLOW_API_KEY="your-api-key"  # Linux/Mac
+# 或
+set SILICONFLOW_API_KEY=your-api-key       # Windows
+
+# 合成 1000 条数据
+python src/data_synthesis/synthesize_code_search_llm.py \
+    --num 1000 \
+    --output data/code_search/sft_1k.json \
+    --model deepseek-ai/DeepSeek-V3
+
+# 如果中断，用 --resume 继续（每 10 条自动保存）
+python src/data_synthesis/synthesize_code_search_llm.py \
+    --num 1000 \
+    --output data/code_search/sft_1k.json \
+    --model deepseek-ai/DeepSeek-V3 \
+    --resume
 ```
 
-### 3. 合成训练数据
+### 3. 分布式合成（可选）
+
+多人协作，加速数据合成：
 
 ```bash
-# 设置 SiliconFlow API Key（或 OpenAI）
-export SILICONFLOW_API_KEY="your-api-key"
+# 你：合成第一部分
+python synthesize_code_search_llm.py --num 500 --output sft_part1.json
 
-# 测试 Prompt
-python src/data_synthesis/synthesize.py --dry-run
+# 朋友：合成第二部分
+python synthesize_code_search_llm.py --num 500 --output sft_part2.json
 
-# 合成 5000 条数据（支持断点续传）
-python src/data_synthesis/synthesize.py --limit 5000 --output raw_5k.json
-
-# 如果中断，用 --resume 继续
-python src/data_synthesis/synthesize.py --limit 5000 --output raw_5k.json --resume
+# 合并数据
+python -c "
+import json, glob
+data = []
+for f in glob.glob('sft_part*.json'):
+    data.extend(json.load(open(f)))
+json.dump(data, open('sft_merged.json', 'w'), ensure_ascii=False, indent=2)
+print(f'Merged {len(data)} samples')
+"
 ```
 
-### 4. 转换为 SFT 格式
-
-```bash
-# 转换并划分 90% 训练 / 10% 验证
-python src/data_synthesis/convert_to_sft.py data/synthetic/raw_5k.json --split 0.9
-```
-
-### 5. 训练模型（QLoRA）
+### 4. 训练模型（QLoRA）
 
 ```bash
 python src/training/sft_qlora.py \
-    --train_data data/synthetic/raw_5k_train.json \
-    --val_data data/synthetic/raw_5k_val.json \
-    --model_name Qwen/Qwen3-1.7B-Instruct \
+    --train_data data/code_search/sft_1k.json \
+    --model_name Qwen/Qwen2.5-1.5B-Instruct \
     --epochs 3 \
-    --mask_info \
-    --output_dir outputs/sft_v1
+    --output_dir outputs/code_search_v1
 ```
 
-### 6. 评测
+### 5. 测试模型
 
 ```bash
-# TODO: 评测脚本
-python src/evaluation/eval.py --model outputs/sft_v1 --dataset hotpotqa
+python scripts/test_model.py \
+    --model outputs/code_search_v1 \
+    --query "Find where TimeoutError is raised"
 ```
 
 ## 📁 项目结构
@@ -102,103 +124,133 @@ python src/evaluation/eval.py --model outputs/sft_v1 --dataset hotpotqa
 ```
 LightningGrep/
 ├── data/
-│   ├── raw/                 # HotpotQA 原始数据
-│   └── synthetic/           # 合成数据
+│   └── code_search/              # 代码检索训练数据
 ├── src/
-│   ├── data_synthesis/      # 数据合成
-│   │   ├── synthesize.py    # 合成脚本
-│   │   ├── convert_to_sft.py # 格式转换
-│   │   └── synthesis_prompt.py # Prompt 定义
-│   ├── training/            # 训练代码
-│   │   └── sft_qlora.py     # QLoRA SFT 训练
-│   └── evaluation/          # 评测代码（TODO）
+│   ├── data_synthesis/
+│   │   └── synthesize_code_search_llm.py  # 数据合成脚本
+│   └── training/
+│       └── sft_qlora.py          # QLoRA SFT 训练
 ├── scripts/
-│   └── download_data.py     # 数据下载
-├── research-plan.md         # 研究计划
+│   ├── download_data.py          # 数据下载
+│   └── test_model.py             # 模型测试
+├── outputs/                      # 训练输出
+├── research-plan.md              # 研究计划
 └── requirements.txt
 ```
 
-## � 研究计划
+## 📋 研究计划
 
 ### 目标
 
-受 [SWE-grep](https://www.cognition.ai/blog/swe-grep) 启发，用 **1.7B 小模型** 实现并行检索能力。
-
-> ⚠️ 注意：这不是 SWE-grep 的复现（他们未开源），而是受其启发的独立实现。
+复刻 Windsurf 的 Fast Context 功能，训练一个能进行**并行代码检索**的小模型。
 
 ### 阶段规划
 
 | 阶段 | 内容 | 状态 |
 |------|------|------|
-| **V1** | 并行检索 + 行号定位 + SFT | 🔄 进行中 |
-| **V2** | RL 策略优化 | ⏳ 待开始 |
+| **V1** | 数据合成 + SFT | 🔄 进行中 |
+| **V2** | SWE-Bench RL | ⏳ 待开始 |
 
-### V1 详细计划
+### V1 进度
 
-- [x] 研究计划制定
-- [x] 数据合成 Prompt 设计
-- [x] 数据合成脚本开发
-- [x] SFT 训练脚本开发（QLoRA）
-- [ ] 合成 5000 条 SFT 数据（⏳ 进行中...）
-- [ ] 转换为 SFT 格式（填充真实内容）
+- [x] 数据格式设计（Qwen FC 标准格式）
+- [x] 数据合成脚本（DeepSeek-V3）
+- [x] 断点续传支持
+- [x] 分布式合成支持
+- [ ] 合成 1000+ 条 SFT 数据（⏳ 进行中...）
 - [ ] QLoRA SFT 训练
-- [ ] 评测脚本开发
-- [ ] HotpotQA 评测
-- [ ] RL 训练脚本开发
-- [ ] RL 训练 + 评测
+- [ ] 评测
 
-## 评测指标
+## 📊 数据格式
 
-| 指标 | 说明 | 目标 |
-|------|------|------|
-| **Recall** | 召回率（返回的位置覆盖 GT）| > 80% |
-| **Precision** | 精确率（返回的位置相关性）| > 70% |
-| **Avg Rounds** | 平均搜索轮数 | < 2.5 |
-| **Parallel Rate** | 并行搜索比例 | > 50% |
+使用 **Qwen 标准 Function Calling 格式**：
 
-### 对比基线
-
-| 模型 | 参数量 | HotpotQA EM | 开源 |
-|------|--------|-------------|------|
-| GAP | 3B | 42.5% | ❌ |
-| Search-R1 | 7B | 37.6% | ✅ |
-| ParallelSearch | 7B | +2.9% | ❌ |
-| **LightningGrep (目标)** | **1.7B** | **>35%** | **✅** |
+```json
+{
+  "messages": [
+    {"role": "user", "content": "Find where TimeoutError is raised"},
+    {
+      "role": "assistant",
+      "content": "Search for TimeoutError in source files",
+      "tool_calls": [
+        {"id": "call_1", "type": "function", "function": {"name": "grep", "arguments": "{\"query\": \"raise TimeoutError\", \"path\": \"src/\"}"}},
+        {"id": "call_2", "type": "function", "function": {"name": "grep", "arguments": "{\"query\": \"TimeoutError(\", \"path\": \"src/\"}"}}
+      ]
+    },
+    {"role": "tool", "tool_call_id": "call_1", "content": "src/client.py:42: raise TimeoutError('Connection timeout')"},
+    {"role": "tool", "tool_call_id": "call_2", "content": "src/server.py:128: raise TimeoutError(f'Request timeout after {timeout}s')"},
+    {"role": "assistant", "content": "{\"result\": {\"files\": [...], \"summary\": \"...\"}}"}
+  ],
+  "tools": [...]
+}
+```
 
 ## 🔬 方法论
 
 ### 训练流程
 
 ```
-SFT（格式 + 基础能力）
+SFT（格式 + 基础策略）
   │
   │  使用合成数据，教模型：
-  │  - 输出格式（<think>, <search>, <result>）
-  │  - 并行/串行判断
-  │  - 基本搜索策略
+  │  - Qwen FC 格式输出
+  │  - 并行工具调用（5-8 个/轮）
+  │  - 多轮搜索策略（3-4 轮）
   │
   ▼
-RL（策略优化）
+ RL（SWE-Bench 优化）
   │
-  │  与真实搜索环境交互，优化：
+  │  真实代码库 + 真实 Issue，优化：
   │  - 搜索精准度
-  │  - 结果筛选能力
   │  - 效率（减少轮数）
   │
   ▼
 最终模型
 ```
 
-### 核心技术
+### SWE-Bench 数据
 
-受 [SWE-grep](https://www.cognition.ai/blog/swe-grep) 博客启发：
+RL 阶段使用 [SWE-Bench](https://www.swebench.com/) 作为训练环境：
 
-- **Policy Gradient** + Per-Sequence Importance Sampling
-- **Leave-One-Out Baseline**
-- **Weighted F1 奖励** (β=0.5)
-- **Mask 环境 Token**：训练时不学习 `<information>` 的生成
+| 字段 | 说明 |
+|------|------|
+| `problem_statement` | GitHub Issue 原文描述 |
+| `repo` | 完整的 Git 仓库 |
+| `base_commit` | 问题发生时的 commit |
+| `patch` | 正确修复的 diff（包含文件+行号） |
 
-详见 [research-plan.md](research-plan.md)
+**训练流程**：
+```
+Issue 描述 → Agent 搜索 → 对比 Patch 中的文件+行号 → 计算 Reward
+```
+
+### RL 训练方法（参考 SWE-grep）
+
+根据 [Windsurf SWE-grep 博客](https://www.cognition.ai/blog/swe-grep)：
+
+| 技术 | 说明 |
+|------|------|
+| **Policy Gradient** | 基础 RL 算法 |
+| **Per-Sequence Importance Sampling** | 处理多轮交互的重要性采样 |
+| **Leave-One-Out Baseline** | 减少方差，用 N-1 个样本估计 baseline |
+| **Weighted F1 奖励** | β=0.5，平衡 Precision 和 Recall |
+| **Mask 环境 Token** | 训练时不学习工具返回内容的生成 |
+
+**奖励函数**：
+```python
+# Weighted F1 (β=0.5，偏向 Recall)
+precision = correct_files / predicted_files
+recall = correct_files / ground_truth_files
+reward = (1 + β²) * (precision * recall) / (β² * precision + recall)
+```
+
+### 工具定义
+
+| 工具 | 参数 | 说明 |
+|------|------|------|
+| `grep` | query, path | 搜索文本模式 |
+| `read` | file, start, end | 读取文件行 |
+| `glob` | pattern | 列出匹配文件 |
 
 ## 📚 参考
 
@@ -211,6 +263,3 @@ RL（策略优化）
 
 MIT
 
-## 🤝 贡献
-
-欢迎 Issue 和 PR！
