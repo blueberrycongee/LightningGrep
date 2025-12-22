@@ -16,8 +16,8 @@ accelerate>=0.25.0
 datasets>=2.15.0
 bitsandbytes>=0.41.0  # QLoRA 量化
 
-# RL 训练（可选）
-# verl>=0.1.0
+# RL 训练
+# REINFORCE 实现不需要额外依赖
 
 # 评测
 numpy>=1.24.0
