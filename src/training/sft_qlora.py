@@ -1,13 +1,63 @@
 """
 QLoRA SFT 训练脚本
 用于训练并行检索模型
+
+使用方法:
+    python src/training/sft_qlora.py \
+        --train_data data/code_search/sft_all_train.json \
+        --val_data data/code_search/sft_all_val.json \
+        --output_dir outputs/sft_v2
 """
 import os
+import sys
 import json
 import torch
 import argparse
 from typing import Dict, List
 from dataclasses import dataclass, field
+
+
+def check_environment():
+    """检查训练环境"""
+    print("=" * 50)
+    print("环境检查")
+    print("=" * 50)
+    
+    # Python 版本
+    print(f"Python: {sys.version.split()[0]}")
+    
+    # PyTorch
+    print(f"PyTorch: {torch.__version__}")
+    
+    # CUDA
+    if torch.cuda.is_available():
+        print(f"CUDA: {torch.version.cuda}")
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"显存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+    else:
+        print("❌ CUDA 不可用！请检查 GPU 环境")
+        sys.exit(1)
+    
+    # 检查依赖
+    try:
+        import transformers
+        import peft
+        import bitsandbytes
+        import datasets
+        print(f"Transformers: {transformers.__version__}")
+        print(f"PEFT: {peft.__version__}")
+        print("✓ 所有依赖已安装")
+    except ImportError as e:
+        print(f"❌ 缺少依赖: {e}")
+        print("请运行: pip install transformers peft accelerate datasets bitsandbytes")
+        sys.exit(1)
+    
+    print("=" * 50)
+    print()
+
+
+# 环境检查
+check_environment()
 
 from datasets import Dataset
 from transformers import (
