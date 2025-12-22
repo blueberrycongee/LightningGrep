@@ -9,19 +9,20 @@ from typing import List, Dict
 
 def convert_sample_to_sft(sample: dict) -> dict:
     """
-    将一条合成数据转换为 SFT 训练格式
+    将一条合成数据转换为 SFT 训练格式（检索工具版本）
     
     输出格式：
     {
-        "input": "Question: ...",
-        "output": "<think>...</think><search>...</search><information>...</information>...<answer>...</answer>",
+        "input": "Query: ...",
+        "output": "<think>...</think><search>...</search><information>...</information><result>...</result>",
         "mask_tags": ["information"]  # 训练时不计算 loss 的标签
     }
+    
+    注意：这是检索工具，不是 QA。输出的是相关文档位置，不是答案。
     """
     question = sample.get("question", "")
-    answer = sample.get("answer", "")
     rounds = sample.get("rounds", [])
-    final_think = sample.get("final_think", "根据搜索结果得出答案")
+    final_think = sample.get("final_think", "找到相关文档")
     sources = sample.get("sources", [])
     
     # 构建完整的输出轨迹
@@ -29,7 +30,7 @@ def convert_sample_to_sft(sample: dict) -> dict:
     source_idx = 0
     
     for round_info in rounds:
-        think = round_info.get("think", "分析问题")
+        think = round_info.get("think", "分析查询")
         searches = round_info.get("searches", [])
         is_parallel = round_info.get("parallel", False)
         
@@ -56,12 +57,21 @@ def convert_sample_to_sft(sample: dict) -> dict:
             output_parts.append(f"<information>{info_content}</information>")
             source_idx += 1
     
-    # 最终思考和答案
+    # 最终思考
     output_parts.append(f"<think>{final_think}</think>")
-    output_parts.append(f"<answer>{answer}</answer>")
+    
+    # 输出检索结果（文档 + 行号），不是答案
+    result_lines = []
+    for source in sources:
+        doc_name = source.get("doc", "Document")
+        lines = source.get("lines", [0])
+        result_lines.append(f"  - {doc_name}: lines {lines}")
+    
+    result_content = "\n".join(result_lines) if result_lines else "  无相关结果"
+    output_parts.append(f"<result>\n{result_content}\n</result>")
     
     return {
-        "input": f"Question: {question}",
+        "input": f"Query: {question}",
         "output": "\n".join(output_parts),
         "mask_tags": ["information"],  # 训练时 mask 这个标签内的内容
         "_id": sample.get("_id", ""),
