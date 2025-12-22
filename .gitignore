@@ -41,10 +41,12 @@ env/
 data/raw/*.json
 data/synthetic/*.json
 data/code_search/*.json
+!data/code_search/sft_all_train.json
+!data/code_search/sft_all_val.json
 !data/*/.gitkeep
 
 # Model outputs
-#outputs/
+outputs/
 checkpoints/
 *.pt
 *.pth

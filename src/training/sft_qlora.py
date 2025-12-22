@@ -17,6 +17,7 @@ from transformers import (
     TrainingArguments,
     Trainer,
     DataCollatorForSeq2Seq,
+    EarlyStoppingCallback,
 )
 from peft import (
     LoraConfig,
@@ -168,7 +169,8 @@ def main():
     
     # 数据参数
     parser.add_argument("--train_data", type=str, required=True, help="训练数据路径")
-    parser.add_argument("--val_data", type=str, default=None, help="验证数据路径")
+    parser.add_argument("--val_data", type=str, default=None, help="验证数据路径（强烈建议提供）")
+    parser.add_argument("--early_stopping_patience", type=int, default=3, help="Early stopping patience")
     
     # 模型参数
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-1.7B-Instruct",
@@ -177,14 +179,14 @@ def main():
     
     # 训练参数
     parser.add_argument("--epochs", type=int, default=3, help="训练轮数")
-    parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
-    parser.add_argument("--gradient_accumulation", type=int, default=16, help="梯度累积步数")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
+    parser.add_argument("--gradient_accumulation", type=int, default=4, help="梯度累积步数")
     parser.add_argument("--learning_rate", type=float, default=2e-4, help="学习率")
-    parser.add_argument("--max_length", type=int, default=2048, help="最大序列长度")
+    parser.add_argument("--max_length", type=int, default=4096, help="最大序列长度")
     
     # LoRA 参数
-    parser.add_argument("--lora_r", type=int, default=16, help="LoRA rank")
-    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha")
+    parser.add_argument("--lora_r", type=int, default=64, help="LoRA rank")
+    parser.add_argument("--lora_alpha", type=int, default=128, help="LoRA alpha")
     parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout")
     
     # 其他
@@ -300,9 +302,11 @@ def main():
         weight_decay=0.01,
         warmup_ratio=0.1,
         logging_steps=10,
-        save_strategy="epoch",
-        eval_strategy="epoch" if val_dataset else "no",
-        save_total_limit=3,  # 最多保留 3 个 checkpoint
+        save_strategy="steps",
+        save_steps=100,
+        eval_strategy="steps" if val_dataset else "no",
+        eval_steps=100,
+        save_total_limit=2,  # 保留 best + last
         load_best_model_at_end=True if val_dataset else False,  # 加载最好的模型
         metric_for_best_model="eval_loss",  # 用 eval_loss 判断
         greater_is_better=False,  # loss 越小越好
@@ -320,6 +324,12 @@ def main():
         return_tensors="pt",
     )
     
+    # Callbacks
+    callbacks = []
+    if val_dataset:
+        callbacks.append(EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience))
+        print(f"  [Early Stopping] patience={args.early_stopping_patience}")
+    
     # Trainer
     trainer = Trainer(
         model=model,
@@ -327,6 +337,7 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         data_collator=data_collator,
+        callbacks=callbacks,
     )
     
     # 训练
