@@ -26,10 +26,6 @@ from peft import (
 )
 
 
-# 特殊标签，需要 mask 的部分
-MASK_TAGS = ["information"]
-
-
 def load_sft_data(data_path: str) -> List[Dict]:
     """加载 SFT 数据"""
     with open(data_path, "r", encoding="utf-8") as f:
@@ -37,68 +33,53 @@ def load_sft_data(data_path: str) -> List[Dict]:
     return data
 
 
-def create_mask_for_tags(
-    input_ids: List[int], 
-    tokenizer, 
-    full_text: str,
-    mask_tags: List[str]
-) -> List[int]:
+def format_fc_messages(messages: List[Dict], tools: List[Dict] = None) -> str:
     """
-    创建 label mask，对于 mask_tags 内的内容不计算 loss
-    返回 labels，其中被 mask 的位置为 -100
+    将 Function Calling 格式的 messages 转换为 Qwen chat 格式
     """
-    labels = input_ids.copy()
+    parts = []
     
-    for tag in mask_tags:
-        start_tag = f"<{tag}>"
-        end_tag = f"</{tag}>"
-        
-        # 找到所有 tag 的位置
-        text = full_text
-        search_start = 0
-        
-        while True:
-            start_pos = text.find(start_tag, search_start)
-            if start_pos == -1:
-                break
-            
-            end_pos = text.find(end_tag, start_pos)
-            if end_pos == -1:
-                break
-            
-            # 计算这段文本对应的 token 位置
-            # 简化处理：找到 tag 内容的 token 范围
-            prefix = text[:start_pos + len(start_tag)]
-            content = text[start_pos + len(start_tag):end_pos]
-            
-            # 编码前缀和内容，计算 token 位置
-            prefix_tokens = tokenizer.encode(prefix, add_special_tokens=False)
-            content_tokens = tokenizer.encode(content, add_special_tokens=False)
-            
-            # Mask 这些位置（包括 tag 本身）
-            tag_start_tokens = tokenizer.encode(start_tag, add_special_tokens=False)
-            tag_end_tokens = tokenizer.encode(end_tag, add_special_tokens=False)
-            
-            # 找到在 input_ids 中的位置并 mask
-            # 简化：mask start_tag 到 end_tag 的所有 token
-            start_idx = len(tokenizer.encode(text[:start_pos], add_special_tokens=False))
-            end_idx = len(tokenizer.encode(text[:end_pos + len(end_tag)], add_special_tokens=False))
-            
-            for i in range(start_idx, min(end_idx, len(labels))):
-                labels[i] = -100
-            
-            search_start = end_pos + len(end_tag)
+    # 添加 tools 定义（如果有）
+    if tools:
+        tools_str = json.dumps(tools, ensure_ascii=False)
+        parts.append(f"<|im_start|>system\nYou are a code search agent. Available tools:\n{tools_str}<|im_end|>")
     
-    return labels
+    for msg in messages:
+        role = msg["role"]
+        
+        if role == "user":
+            parts.append(f"<|im_start|>user\n{msg['content']}<|im_end|>")
+        
+        elif role == "assistant":
+            content = msg.get("content", "")
+            tool_calls = msg.get("tool_calls", [])
+            
+            if tool_calls:
+                # 有 tool calls 的 assistant 消息
+                tc_str = json.dumps(tool_calls, ensure_ascii=False)
+                if content:
+                    parts.append(f"<|im_start|>assistant\n{content}\n<tool_calls>\n{tc_str}\n</tool_calls><|im_end|>")
+                else:
+                    parts.append(f"<|im_start|>assistant\n<tool_calls>\n{tc_str}\n</tool_calls><|im_end|>")
+            else:
+                # 普通 assistant 消息（最终结果）
+                parts.append(f"<|im_start|>assistant\n{content}<|im_end|>")
+        
+        elif role == "tool":
+            # Tool 结果
+            tool_call_id = msg.get("tool_call_id", "")
+            content = msg.get("content", "")
+            parts.append(f"<|im_start|>tool\n<tool_call_id>{tool_call_id}</tool_call_id>\n{content}<|im_end|>")
+    
+    return "\n".join(parts)
 
 
 def preprocess_function(
     examples: Dict,
     tokenizer,
-    max_length: int = 2048,
-    mask_info: bool = True,
+    max_length: int = 4096,
 ) -> Dict:
-    """预处理函数：将 input/output 转换为模型输入格式"""
+    """预处理 Function Calling 格式的 SFT 数据"""
     
     model_inputs = {
         "input_ids": [],
@@ -106,13 +87,13 @@ def preprocess_function(
         "labels": [],
     }
     
-    for i in range(len(examples["input"])):
-        input_text = examples["input"][i]
-        output_text = examples["output"][i]
+    for i in range(len(examples["messages"])):
+        messages = examples["messages"][i]
+        tools_list = examples.get("tools", [])
+        tools = tools_list[i] if i < len(tools_list) else None
         
-        # 构建完整的对话格式
-        # Qwen3 格式
-        full_text = f"<|im_start|>user\n{input_text}<|im_end|>\n<|im_start|>assistant\n{output_text}<|im_end|>"
+        # 转换为 chat 格式
+        full_text = format_fc_messages(messages, tools)
         
         # Tokenize
         tokenized = tokenizer(
@@ -126,46 +107,54 @@ def preprocess_function(
         input_ids = tokenized["input_ids"]
         attention_mask = tokenized["attention_mask"]
         
-        # 创建 labels
-        # 1. 首先，input 部分不计算 loss
-        user_part = f"<|im_start|>user\n{input_text}<|im_end|>\n<|im_start|>assistant\n"
-        user_tokens = tokenizer.encode(user_part, add_special_tokens=False)
+        # 创建 labels：只在 assistant 消息上计算 loss
+        # 高效方法：在文本层面找到 assistant 区域，再转换为 token 索引
+        labels = [-100] * len(input_ids)  # 默认全部 mask
         
-        labels = [-100] * len(user_tokens) + input_ids[len(user_tokens):]
+        # 找到所有 assistant 区域的字符位置
+        assistant_start_tag = "<|im_start|>assistant\n"
+        assistant_end_tag = "<|im_end|>"
         
-        # 2. 如果需要 mask <information>，处理 output 部分
-        if mask_info and "mask_tags" in examples:
-            mask_tags = examples["mask_tags"][i] if examples["mask_tags"][i] else []
-            if mask_tags:
-                # 简化处理：找到 <information> 并 mask
-                assistant_part = output_text
-                for tag in mask_tags:
-                    start_tag = f"<{tag}>"
-                    end_tag = f"</{tag}>"
-                    
-                    search_start = 0
-                    while True:
-                        start_pos = assistant_part.find(start_tag, search_start)
-                        if start_pos == -1:
-                            break
-                        end_pos = assistant_part.find(end_tag, start_pos)
-                        if end_pos == -1:
-                            break
-                        
-                        # 计算在 full_text 中的位置
-                        full_start = len(user_part) + start_pos
-                        full_end = len(user_part) + end_pos + len(end_tag)
-                        
-                        # 转换为 token 索引
-                        token_start = len(tokenizer.encode(full_text[:full_start], add_special_tokens=False))
-                        token_end = len(tokenizer.encode(full_text[:full_end], add_special_tokens=False))
-                        
-                        # Mask
-                        for j in range(token_start, min(token_end, len(labels))):
-                            if j < len(labels):
-                                labels[j] = -100
-                        
-                        search_start = end_pos + len(end_tag)
+        search_pos = 0
+        while True:
+            start_pos = full_text.find(assistant_start_tag, search_pos)
+            if start_pos == -1:
+                break
+            
+            # assistant 内容从 tag 之后开始
+            content_start = start_pos + len(assistant_start_tag)
+            end_pos = full_text.find(assistant_end_tag, content_start)
+            if end_pos == -1:
+                end_pos = len(full_text)
+            
+            # 包含 end tag
+            content_end = end_pos + len(assistant_end_tag)
+            
+            # 使用 offset_mapping 精确计算 token 位置
+            # 先获取完整文本的 token 对应的字符范围
+            encoded_with_offsets = tokenizer(
+                full_text,
+                return_offsets_mapping=True,
+                add_special_tokens=False,
+                truncation=True,
+                max_length=max_length,
+            )
+            offsets = encoded_with_offsets.get("offset_mapping", [])
+            
+            # 找到 content_start 和 content_end 对应的 token 索引
+            prefix_tokens = 0
+            suffix_tokens = 0
+            for idx, (start, end) in enumerate(offsets):
+                if start < content_start:
+                    prefix_tokens = idx + 1
+                if start < content_end:
+                    suffix_tokens = idx + 1
+            
+            # 这些位置的 token 需要计算 loss
+            for j in range(prefix_tokens, min(suffix_tokens, len(input_ids))):
+                labels[j] = input_ids[j]
+            
+            search_pos = content_end
         
         model_inputs["input_ids"].append(input_ids)
         model_inputs["attention_mask"].append(attention_mask)
@@ -199,7 +188,6 @@ def main():
     parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout")
     
     # 其他
-    parser.add_argument("--mask_info", action="store_true", help="是否 mask <information> 标签")
     parser.add_argument("--dry_run", action="store_true", help="只打印配置，不训练")
     parser.add_argument("--resume", action="store_true", help="从最新 checkpoint 断点续训")
     
@@ -214,7 +202,7 @@ def main():
     print(f"Epochs: {args.epochs}")
     print(f"Batch size: {args.batch_size} x {args.gradient_accumulation} = {args.batch_size * args.gradient_accumulation}")
     print(f"LoRA: r={args.lora_r}, alpha={args.lora_alpha}")
-    print(f"Mask <information>: {args.mask_info}")
+    print(f"Max length: {args.max_length}")
     print("=" * 50)
     
     if args.dry_run:
@@ -250,7 +238,6 @@ def main():
             examples, 
             tokenizer, 
             max_length=args.max_length,
-            mask_info=args.mask_info,
         )
     
     train_dataset = train_dataset.map(
@@ -344,7 +331,6 @@ def main():
     
     # 训练
     if args.resume:
-        import os
         checkpoints = [d for d in os.listdir(args.output_dir) if d.startswith("checkpoint-")] if os.path.exists(args.output_dir) else []
         if checkpoints:
             latest = max(checkpoints, key=lambda x: int(x.split("-")[1]))

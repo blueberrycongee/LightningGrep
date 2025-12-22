@@ -9,6 +9,7 @@ import random
 from typing import Optional, List, Dict
 from openai import OpenAI
 from tqdm import tqdm
+import anthropic
 
 # 配置
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data")
@@ -25,6 +26,11 @@ API_CONFIGS = {
         "base_url": "https://api.openai.com/v1",
         "default_model": "gpt-4o",
         "env_key": "OPENAI_API_KEY",
+    },
+    "anthropic": {
+        "base_url": "https://anyrouter.top",  # anyrouter 代理（不带 /v1）
+        "default_model": "claude-haiku-4-5-20251001",  # Claude Haiku 4.5（便宜快速）
+        "env_key": "ANTHROPIC_API_KEY",
     },
 }
 
@@ -383,7 +389,14 @@ def synthesize_batch(
         print(f"[Error] Set {config['env_key']} environment variable")
         return
     
-    client = OpenAI(api_key=api_key, base_url=config["base_url"])
+    # 根据 provider 选择客户端
+    if provider == "anthropic":
+        client = anthropic.Anthropic(
+            api_key=api_key,
+            base_url=config["base_url"]
+        )
+    else:
+        client = OpenAI(api_key=api_key, base_url=config["base_url"])
     
     print(f"[Config] Provider: {provider}, Model: {model}")
     print(f"[Target] {num_samples} samples")
@@ -417,17 +430,28 @@ def synthesize_batch(
         user_prompt = create_prompt(query, scenario)
         
         try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.8,
-                max_tokens=2000,
-            )
-            
-            result_text = response.choices[0].message.content
+            # 根据 provider 使用不同的 API 格式
+            if provider == "anthropic":
+                response = client.messages.create(
+                    model=model,
+                    max_tokens=2000,
+                    system=SYSTEM_PROMPT,
+                    messages=[
+                        {"role": "user", "content": user_prompt}
+                    ],
+                )
+                result_text = response.content[0].text
+            else:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    temperature=0.8,
+                    max_tokens=2000,
+                )
+                result_text = response.choices[0].message.content
             result = extract_json(result_text)
             
             if result is None:

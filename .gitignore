@@ -44,7 +44,7 @@ data/code_search/*.json
 !data/*/.gitkeep
 
 # Model outputs
-outputs/
+#outputs/
 checkpoints/
 *.pt
 *.pth
