@@ -42,6 +42,7 @@ class CodeSearchEnv:
         self.files_found = set()
         self.lines_found = {}
         self.history = []
+        self.submitted_answer = None  # 模型提交的最终答案
     
     def reset(self):
         """重置环境"""
@@ -50,6 +51,7 @@ class CodeSearchEnv:
         self.files_found = set()
         self.lines_found = {}
         self.history = []
+        self.submitted_answer = None
     
     def step(self, tool_calls: List[Dict]) -> Tuple[List[Dict], bool]:
         """
@@ -107,10 +109,53 @@ class CodeSearchEnv:
                 return self._glob(args.get("pattern", "*"))
             elif name == "find":
                 return self._find(args.get("name", ""))
+            elif name == "submit":
+                return self._submit(args.get("results", []))
             else:
                 return f"Unknown tool: {name}"
         except Exception as e:
             return f"Error: {str(e)}"
+    
+    def _submit(self, results: List[Dict]) -> str:
+        """
+        处理模型提交的最终答案
+        
+        Args:
+            results: [{"file": "path/to/file", "start_line": 10, "end_line": 20}, ...]
+        
+        Returns:
+            确认信息
+        """
+        # 限制最多 8 个结果
+        results = results[:8]
+        
+        # 验证并存储
+        valid_results = []
+        for r in results:
+            if isinstance(r, dict) and "file" in r:
+                file_path = r.get("file", "")
+                start_line = r.get("start_line", 1)
+                end_line = r.get("end_line", start_line + 10)
+                
+                # 验证文件存在
+                full_path = self.repo_path / file_path
+                if full_path.exists():
+                    valid_results.append({
+                        "file": file_path,
+                        "start_line": int(start_line),
+                        "end_line": int(end_line)
+                    })
+        
+        self.submitted_answer = valid_results
+        
+        if valid_results:
+            summary = "\n".join([
+                f"  {i+1}. {r['file']}:{r['start_line']}-{r['end_line']}"
+                for i, r in enumerate(valid_results)
+            ])
+            return f"Submitted {len(valid_results)} results:\n{summary}"
+        else:
+            return "No valid results submitted"
     
     def _grep(self, query: str, path: str = ".") -> str:
         """
@@ -269,7 +314,8 @@ class CodeSearchEnv:
         self,
         ground_truth_files: List[str],
         ground_truth_lines: Dict[str, List[Tuple[int, int]]] = None,
-        beta: float = 0.5
+        beta: float = 0.5,
+        use_submission: bool = True
     ) -> float:
         """
         计算 reward (Weighted F1, β=0.5 偏向 Precision)
@@ -280,6 +326,7 @@ class CodeSearchEnv:
             ground_truth_files: 真实需要找到的文件
             ground_truth_lines: 真实需要找到的行范围 {file: [(start, end), ...]}
             beta: F-beta 的 beta 值，<1 偏向 precision，>1 偏向 recall
+            use_submission: 是否优先使用 submit 工具的答案
         
         Returns:
             reward: F-beta score
@@ -287,6 +334,13 @@ class CodeSearchEnv:
         if not ground_truth_files:
             return 0.0
         
+        # 如果有 submit 的答案，优先使用
+        if use_submission and self.submitted_answer:
+            return self._compute_reward_from_submission(
+                ground_truth_files, ground_truth_lines, beta
+            )
+        
+        # 否则使用隐式收集的结果
         # 1. 文件级 F1
         file_f1 = self._compute_file_f1(ground_truth_files, beta)
         
@@ -294,6 +348,74 @@ class CodeSearchEnv:
         if ground_truth_lines:
             line_f1 = self._compute_line_f1(ground_truth_lines, beta)
             # 博客: 文件和行的平均
+            return (file_f1 + line_f1) / 2
+        
+        return file_f1
+    
+    def _compute_reward_from_submission(
+        self,
+        ground_truth_files: List[str],
+        ground_truth_lines: Dict[str, List[Tuple[int, int]]] = None,
+        beta: float = 0.5
+    ) -> float:
+        """
+        基于 submit 工具的答案计算 reward
+        
+        submitted_answer: [{"file": "path", "start_line": 10, "end_line": 20}, ...]
+        """
+        if not self.submitted_answer:
+            return 0.0
+        
+        # 提取提交的文件和行
+        submitted_files = set()
+        submitted_lines = {}
+        
+        for r in self.submitted_answer:
+            file = r["file"]
+            submitted_files.add(file)
+            
+            if file not in submitted_lines:
+                submitted_lines[file] = []
+            submitted_lines[file].append((r["start_line"], r["end_line"]))
+        
+        # 1. 文件级 F-beta
+        gt_file_set = set(ground_truth_files)
+        correct_files = len(gt_file_set & submitted_files)
+        
+        precision = correct_files / len(submitted_files) if submitted_files else 0
+        recall = correct_files / len(gt_file_set) if gt_file_set else 0
+        
+        if precision + recall == 0:
+            file_f1 = 0.0
+        else:
+            beta_sq = beta ** 2
+            file_f1 = (1 + beta_sq) * (precision * recall) / (beta_sq * precision + recall)
+        
+        # 2. 行级 F-beta（如果有 ground truth）
+        if ground_truth_lines:
+            gt_lines = set()
+            for file, ranges in ground_truth_lines.items():
+                for start, end in ranges:
+                    for line in range(start, end + 1):
+                        gt_lines.add((file, line))
+            
+            found_lines = set()
+            for file, ranges in submitted_lines.items():
+                for start, end in ranges:
+                    for line in range(start, end + 1):
+                        found_lines.add((file, line))
+            
+            correct_lines = len(gt_lines & found_lines)
+            
+            precision = correct_lines / len(found_lines) if found_lines else 0
+            recall = correct_lines / len(gt_lines) if gt_lines else 0
+            
+            if precision + recall == 0:
+                line_f1 = 0.0
+            else:
+                beta_sq = beta ** 2
+                line_f1 = (1 + beta_sq) * (precision * recall) / (beta_sq * precision + recall)
+            
             return (file_f1 + line_f1) / 2
         
         return file_f1
@@ -413,6 +535,33 @@ TOOLS_DEFINITION = [
                     "name": {"type": "string", "description": "File name to search"}
                 },
                 "required": ["name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "submit",
+            "description": "Submit your final answer with the most relevant files and line ranges. Call this in your last turn. Maximum 8 files, ordered by relevance (most relevant first).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "results": {
+                        "type": "array",
+                        "description": "List of relevant code locations, ordered by importance",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file": {"type": "string", "description": "File path relative to repo root"},
+                                "start_line": {"type": "integer", "description": "Start line number"},
+                                "end_line": {"type": "integer", "description": "End line number"}
+                            },
+                            "required": ["file", "start_line", "end_line"]
+                        },
+                        "maxItems": 8
+                    }
+                },
+                "required": ["results"]
             }
         }
     }

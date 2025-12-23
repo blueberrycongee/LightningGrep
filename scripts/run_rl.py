@@ -337,6 +337,135 @@ def get_repo_tree(repo_path: Path, max_depth: int = 2, max_items: int = 50) -> s
     return "\n".join(lines)
 
 
+def parse_answer_format(text: str) -> List[Dict]:
+    """
+    解析 <answer> 格式的输出
+    
+    格式:
+    <answer>
+    1. path/to/file.py:10-25
+    2. path/to/other.py:100-120
+    </answer>
+    
+    Returns:
+        [{"file": "path/to/file.py", "start_line": 10, "end_line": 25}, ...]
+    """
+    import re
+    
+    results = []
+    
+    # 提取 <answer>...</answer> 内容
+    answer_match = re.search(r'<answer>(.*?)</answer>', text, re.DOTALL)
+    if not answer_match:
+        return results
+    
+    answer_content = answer_match.group(1).strip()
+    
+    # 解析每一行
+    # 格式: 1. path/to/file.py:10-25  或  path/to/file.py:10-25
+    line_pattern = r'(?:\d+\.\s*)?([^:\s]+):(\d+)-(\d+)'
+    
+    for match in re.finditer(line_pattern, answer_content):
+        file_path = match.group(1).strip()
+        start_line = int(match.group(2))
+        end_line = int(match.group(3))
+        
+        results.append({
+            "file": file_path,
+            "start_line": start_line,
+            "end_line": end_line
+        })
+        
+        # 最多 8 个
+        if len(results) >= 8:
+            break
+    
+    return results
+
+
+def compute_answer_reward(
+    answer: List[Dict],
+    ground_truth_files: List[str],
+    ground_truth_lines: Dict[str, List[Tuple[int, int]]] = None,
+    beta: float = 0.5
+) -> float:
+    """
+    计算基于 <answer> 的 reward
+    
+    博客设计: reward = (file_F1 + line_F1) / 2
+    使用 β=0.5，Precision 权重是 Recall 的 2 倍
+    
+    Args:
+        answer: [{"file": "path", "start_line": 10, "end_line": 20}, ...]
+        ground_truth_files: 真实文件列表
+        ground_truth_lines: 真实行范围 {file: [(start, end), ...]}
+        beta: F-beta 的 beta 值
+    
+    Returns:
+        reward: 0.0 到 1.0
+    """
+    if not answer:
+        return 0.0
+    
+    # 提取提交的文件和行
+    submitted_files = set()
+    submitted_lines = {}
+    
+    for r in answer:
+        file = r["file"]
+        submitted_files.add(file)
+        
+        if file not in submitted_lines:
+            submitted_lines[file] = []
+        submitted_lines[file].append((r["start_line"], r["end_line"]))
+    
+    # 1. 文件级 F-beta
+    gt_file_set = set(ground_truth_files)
+    correct_files = len(gt_file_set & submitted_files)
+    
+    precision = correct_files / len(submitted_files) if submitted_files else 0
+    recall = correct_files / len(gt_file_set) if gt_file_set else 0
+    
+    if precision + recall == 0:
+        file_f1 = 0.0
+    else:
+        beta_sq = beta ** 2
+        file_f1 = (1 + beta_sq) * (precision * recall) / (beta_sq * precision + recall)
+    
+    # 2. 行级 F-beta（如果有 ground truth）
+    if ground_truth_lines:
+        gt_lines = set()
+        for file, ranges in ground_truth_lines.items():
+            for start, end in ranges:
+                for line in range(start, end + 1):
+                    gt_lines.add((file, line))
+        
+        found_lines = set()
+        for file, ranges in submitted_lines.items():
+            for start, end in ranges:
+                for line in range(start, end + 1):
+                    found_lines.add((file, line))
+        
+        if not found_lines:
+            line_f1 = 0.0
+        else:
+            correct_lines = len(gt_lines & found_lines)
+            
+            precision = correct_lines / len(found_lines) if found_lines else 0
+            recall = correct_lines / len(gt_lines) if gt_lines else 0
+            
+            if precision + recall == 0:
+                line_f1 = 0.0
+            else:
+                beta_sq = beta ** 2
+                line_f1 = (1 + beta_sq) * (precision * recall) / (beta_sq * precision + recall)
+        
+        # 博客: 文件和行的平均
+        return (file_f1 + line_f1) / 2
+    
+    return file_f1
+
+
 # ========== SWE-grep 风格 RL 训练 ==========
 # 完整实现 Cognition/Windsurf 博客描述的技术
 
@@ -354,6 +483,7 @@ class Trajectory:
     tool_calls_count: int          # 工具调用总数
     turns: int                     # 实际轮数
     format_error: bool = False     # 是否有格式错误
+    submitted_answer: List[Dict] = None  # 模型提交的答案
 
 
 class SWEGrepTrainer:
@@ -426,9 +556,29 @@ class SWEGrepTrainer:
         
         # System prompt + User query
         system_prompt = """You are a code search agent. Your task is to find relevant files and code locations.
-Use the available tools (grep, read, glob, find) to search the codebase.
-You can make up to 8 parallel tool calls per turn.
-After searching, provide the relevant file paths and line ranges."""
+
+Available tools:
+- grep: Search for text patterns in files
+- read: Read specific lines from a file  
+- glob: List files matching a pattern
+- find: Find files by name
+
+Rules:
+1. You have 4 turns maximum: use turns 1-3 for exploration, turn 4 for your answer
+2. You can make up to 8 parallel tool calls per turn
+3. After exploring, provide your final answer in the <answer> format
+
+Answer format (provide in your final response):
+<answer>
+1. path/to/file.py:10-25
+2. path/to/other.py:100-120
+3. path/to/another.py:50-80
+</answer>
+
+Rules for your answer:
+- Maximum 8 locations, ordered by importance (most important first)
+- Format: filepath:start_line-end_line
+- Only include locations you are confident about"""
         
         user_prompt = f"""Repository: {instance["repo"]}
 
@@ -440,7 +590,7 @@ Directory structure:
 Issue:
 {instance["problem_statement"]}
 
-Find the relevant files and code locations for this issue."""
+Find the relevant files and code locations. After exploring with tools, provide your answer in the <answer> format."""
         
         messages = [
             {"role": "system", "content": system_prompt},
@@ -496,10 +646,16 @@ Find the relevant files and code locations for this issue."""
             # 解析 tool calls
             tool_calls = self._parse_tool_calls(response)
             
-            # 检查格式（博客: incorrectly formatted tool call → 0 reward）
+            # 检查是否有 <answer> 格式的输出（最后一轮可以没有 tool call）
+            parsed_answer = parse_answer_format(response)
+            
             if not tool_calls:
-                if turn < self.max_turns - 1:
-                    # 非最后一轮没有 tool call = 格式错误
+                if parsed_answer:
+                    # 有 <answer> 格式，这是最终答案
+                    messages.append({"role": "assistant", "content": response})
+                    break
+                elif turn < self.max_turns - 1:
+                    # 非最后一轮没有 tool call 也没有 answer = 格式错误
                     format_error = True
                 break
             
@@ -513,14 +669,31 @@ Find the relevant files and code locations for this issue."""
             for result in results:
                 messages.append({"role": "tool", "content": result["content"]})
             
+            # 检查是否有 <answer>（可以在任何轮次提交答案）
+            if parsed_answer:
+                break
+            
             if done:
                 break
+        
+        # 从所有消息中提取最终答案
+        final_answer = []
+        for msg in messages:
+            if msg.get("role") == "assistant":
+                answer = parse_answer_format(msg.get("content", ""))
+                if answer:
+                    final_answer = answer  # 取最后一个有效答案
+        
+        # 检查是否有有效答案
+        if not final_answer:
+            format_error = True
         
         # 计算 reward（博客: weighted F1, β=0.5）
         if format_error:
             reward = 0.0
         else:
-            reward = env.compute_reward(ground_truth_files, ground_truth_lines, beta=0.5)
+            # 使用 <answer> 的内容计算 reward
+            reward = compute_answer_reward(final_answer, ground_truth_files, ground_truth_lines, beta=0.5)
         
         # 计算 log_prob（需要梯度）
         # 对每轮生成做 forward pass，计算 token-level log_prob
@@ -557,6 +730,7 @@ Find the relevant files and code locations for this issue."""
             tool_calls_count=tool_calls_count,
             turns=actual_turns,
             format_error=format_error,
+            submitted_answer=final_answer,  # <answer> 解析的结果
         )
     
     def _parse_tool_calls(self, response: str) -> List[Dict]:
