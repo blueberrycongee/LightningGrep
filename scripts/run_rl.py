@@ -339,6 +339,63 @@ class RepoManager:
                 )
 
 
+# ========== SFT 格式 Prompt 构造（和训练时一致）==========
+
+def format_sft_prompt(
+    messages: List[Dict], 
+    tools: List[Dict] = None,
+    add_generation_prompt: bool = True
+) -> str:
+    """
+    将 messages 转换为 SFT 训练时的格式
+    必须和 sft_qlora.py 中的 format_fc_messages 保持一致
+    """
+    parts = []
+    
+    # 添加 tools 定义（如果有）
+    if tools:
+        tools_str = json.dumps(tools, ensure_ascii=False, indent=2)
+        parts.append(f"<|im_start|>system\nYou are a code search agent. Available tools:\n{tools_str}<|im_end|>")
+    
+    for msg in messages:
+        role = msg["role"]
+        
+        if role == "system":
+            # 自定义 system prompt
+            parts.append(f"<|im_start|>system\n{msg['content']}<|im_end|>")
+        
+        elif role == "user":
+            parts.append(f"<|im_start|>user\n{msg['content']}<|im_end|>")
+        
+        elif role == "assistant":
+            content = msg.get("content", "")
+            tool_calls = msg.get("tool_calls", [])
+            
+            if tool_calls:
+                # 有 tool calls 的 assistant 消息
+                tc_str = json.dumps(tool_calls, ensure_ascii=False)
+                if content:
+                    parts.append(f"<|im_start|>assistant\n{content}\n<tool_calls>\n{tc_str}\n</tool_calls><|im_end|>")
+                else:
+                    parts.append(f"<|im_start|>assistant\n<tool_calls>\n{tc_str}\n</tool_calls><|im_end|>")
+            else:
+                parts.append(f"<|im_start|>assistant\n{content}<|im_end|>")
+        
+        elif role == "tool":
+            # Tool 结果
+            tool_call_id = msg.get("tool_call_id", "")
+            content = msg.get("content", "")
+            parts.append(f"<|im_start|>tool\n<tool_call_id>{tool_call_id}</tool_call_id>\n{content}<|im_end|>")
+    
+    result = "\n".join(parts)
+    
+    # 添加生成提示
+    if add_generation_prompt:
+        result += "\n<|im_start|>assistant\n"
+    
+    return result
+
+
 # ========== 奖励计算（使用 env.compute_reward，支持文件+行级 F1）==========
 
 
@@ -657,12 +714,11 @@ Find the relevant files and code locations. After exploring with tools, provide 
         for turn in range(self.max_turns):
             actual_turns = turn + 1
             
-            # 构建输入
-            prompt = self.tokenizer.apply_chat_template(
+            # 构建输入（使用 SFT 训练时的格式）
+            prompt = format_sft_prompt(
                 messages,
-                tools=TOOLS_DEFINITION,
+                tools=TOOLS_DEFINITION if turn == 0 else None,  # 只在第一轮加 tools
                 add_generation_prompt=True,
-                tokenize=False,
             )
             inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
             input_ids = inputs["input_ids"]
@@ -721,10 +777,35 @@ Find the relevant files and code locations. After exploring with tools, provide 
             # 执行 tool calls
             results, done = env.step(tool_calls)
             
-            # 更新消息
-            messages.append({"role": "assistant", "content": response})
-            for result in results:
-                messages.append({"role": "tool", "content": result["content"]})
+            # 更新消息（使用 SFT 格式）
+            # 提取 <tool_calls> 之前的内容作为 content
+            content_before_tools = response.split("<tool_calls>")[0].strip()
+            
+            # 构造 SFT 格式的 tool_calls
+            sft_tool_calls = []
+            for i, tc in enumerate(tool_calls):
+                sft_tool_calls.append({
+                    "id": tc.get("id", f"call_{i+1}"),
+                    "type": "function",
+                    "function": {
+                        "name": tc["name"],
+                        "arguments": json.dumps(tc["arguments"], ensure_ascii=False)
+                    }
+                })
+            
+            messages.append({
+                "role": "assistant", 
+                "content": content_before_tools,
+                "tool_calls": sft_tool_calls
+            })
+            
+            # 添加 tool 结果（带 tool_call_id）
+            for i, result in enumerate(results):
+                messages.append({
+                    "role": "tool", 
+                    "tool_call_id": tool_calls[i].get("id", f"call_{i+1}") if i < len(tool_calls) else "",
+                    "content": result["content"]
+                })
             
             # 检查是否有 <answer>（可以在任何轮次提交答案）
             if parsed_answer:
@@ -772,39 +853,46 @@ Find the relevant files and code locations. After exploring with tools, provide 
         )
     
     def _parse_tool_calls(self, response: str) -> List[Dict]:
-        """解析工具调用（支持多种格式）"""
+        """
+        解析工具调用（匹配 SFT 训练时的格式）
+        
+        SFT 格式:
+        <tool_calls>
+        [{"id": "call_1", "type": "function", "function": {"name": "grep", "arguments": "{...}"}}]
+        </tool_calls>
+        """
         import re
         
         tool_calls = []
         
-        # Qwen3 格式: <tool_call>{"name": "grep", "arguments": {...}}</tool_call>
-        # 也支持: {"name": "grep", "arguments": {...}}
+        # 提取 <tool_calls>...</tool_calls> 内容
+        pattern = r'<tool_calls>\s*(.*?)\s*</tool_calls>'
+        match = re.search(pattern, response, re.DOTALL)
         
-        # 先提取 </think> 后面的内容（如果有）
-        if '</think>' in response:
-            response = response.split('</think>', 1)[1]
-        
-        # 模式1: <tool_call>JSON</tool_call>
-        pattern1 = r'<tool_call>\s*(\{.*?\})\s*</tool_call>'
-        for match in re.finditer(pattern1, response, re.DOTALL):
+        if match:
             try:
-                call = json.loads(match.group(1))
-                if "name" in call:
-                    tool_calls.append(call)
+                # 解析 JSON 数组
+                calls_json = match.group(1).strip()
+                calls = json.loads(calls_json)
+                
+                if isinstance(calls, list):
+                    for call in calls:
+                        # SFT 格式: {"id": "...", "type": "function", "function": {"name": "...", "arguments": "..."}}
+                        if "function" in call:
+                            func = call["function"]
+                            name = func.get("name", "")
+                            args_str = func.get("arguments", "{}")
+                            try:
+                                args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                            except json.JSONDecodeError:
+                                args = {}
+                            tool_calls.append({
+                                "id": call.get("id", f"call_{len(tool_calls)+1}"),
+                                "name": name,
+                                "arguments": args
+                            })
             except json.JSONDecodeError:
-                continue
-        
-        # 模式2: 直接的 JSON 对象 {"name": "...", "arguments": {...}}
-        if not tool_calls:
-            pattern2 = r'\{\s*"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(\{[^}]*\})\s*\}'
-            for match in re.finditer(pattern2, response):
-                try:
-                    tool_calls.append({
-                        "name": match.group(1),
-                        "arguments": json.loads(match.group(2))
-                    })
-                except json.JSONDecodeError:
-                    continue
+                pass
         
         return tool_calls[:8]  # 最多 8 个并行调用
     
