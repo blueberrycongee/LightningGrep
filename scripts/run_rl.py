@@ -662,30 +662,41 @@ class SWEGrepTrainer:
         repo_tree = get_repo_tree(repo_path)
         
         # System prompt + User query
-        system_prompt = """You are a code search agent. Your task is to find relevant files and code locations.
+        system_prompt = """You are a code search agent. Find relevant files and code locations.
 
-Available tools:
-- grep: Search for text patterns in files
-- read: Read specific lines from a file  
-- glob: List files matching a pattern
-- find: Find files by name
+## Tool Call Format (MUST follow EXACTLY)
 
-Rules:
-1. You have 4 turns maximum: use turns 1-3 for exploration, turn 4 for your answer
-2. You can make up to 8 parallel tool calls per turn
-3. After exploring, provide your final answer in the <answer> format
+<tool_calls>
+[{"id": "call_1", "type": "function", "function": {"name": "NAME", "arguments": "{\"key\": \"value\"}"}}]
+</tool_calls>
 
-Answer format (provide in your final response):
+CRITICAL RULES for arguments:
+- arguments MUST be a JSON string with escaped quotes: "{\"key\": \"value\"}"
+- WRONG: "arguments": "{"key": "value"}"
+- RIGHT: "arguments": "{\"key\": \"value\"}"
+
+## Available Tools
+
+1. grep: {"query": "pattern", "path": "dir/"} - Search text in files
+2. read: {"file": "path", "start": 1, "end": 50} - Read file lines  
+3. glob: {"pattern": "**/*.py"} - List files by pattern
+4. find: {"name": "filename"} - Find files by name
+
+## Example
+
+User: Find error handling code
+Assistant: Let me search for error handling patterns.
+<tool_calls>
+[{"id": "call_1", "type": "function", "function": {"name": "grep", "arguments": "{\"query\": \"except\", \"path\": \"src/\"}"}}, {"id": "call_2", "type": "function", "function": {"name": "glob", "arguments": "{\"pattern\": \"**/*error*.py\"}"}}]
+</tool_calls>
+
+## Rules
+- Maximum 4 turns, 8 tool calls per turn
+- Final answer format:
 <answer>
-1. path/to/file.py:10-25
-2. path/to/other.py:100-120
-3. path/to/another.py:50-80
-</answer>
-
-Rules for your answer:
-- Maximum 8 locations, ordered by importance (most important first)
-- Format: filepath:start_line-end_line
-- Only include locations you are confident about"""
+1. path/file.py:10-25
+2. path/other.py:100-120
+</answer>"""
         
         user_prompt = f"""Repository: {instance["repo"]}
 
@@ -854,45 +865,60 @@ Find the relevant files and code locations. After exploring with tools, provide 
     
     def _parse_tool_calls(self, response: str) -> List[Dict]:
         """
-        解析工具调用（匹配 SFT 训练时的格式）
-        
-        SFT 格式:
-        <tool_calls>
-        [{"id": "call_1", "type": "function", "function": {"name": "grep", "arguments": "{...}"}}]
-        </tool_calls>
+        解析工具调用（容错解析，处理未转义引号）
         """
         import re
         
         tool_calls = []
         
-        # 提取 <tool_calls>...</tool_calls> 内容
+        # 提取所有 <tool_calls>...</tool_calls> 内容（可能有多个）
         pattern = r'<tool_calls>\s*(.*?)\s*</tool_calls>'
-        match = re.search(pattern, response, re.DOTALL)
+        matches = re.findall(pattern, response, re.DOTALL)
         
-        if match:
+        for calls_json in matches:
+            calls_json = calls_json.strip()
+            
+            # 方法1：尝试直接解析
             try:
-                # 解析 JSON 数组
-                calls_json = match.group(1).strip()
                 calls = json.loads(calls_json)
-                
                 if isinstance(calls, list):
                     for call in calls:
-                        # SFT 格式: {"id": "...", "type": "function", "function": {"name": "...", "arguments": "..."}}
                         if "function" in call:
                             func = call["function"]
                             name = func.get("name", "")
                             args_str = func.get("arguments", "{}")
                             try:
                                 args = json.loads(args_str) if isinstance(args_str, str) else args_str
-                            except json.JSONDecodeError:
+                            except:
                                 args = {}
                             tool_calls.append({
                                 "id": call.get("id", f"call_{len(tool_calls)+1}"),
                                 "name": name,
                                 "arguments": args
                             })
+                continue
             except json.JSONDecodeError:
                 pass
+            
+            # 方法2：容错解析 - 提取 name 和 arguments 内容
+            # 匹配: "name": "grep" 和 "arguments": "{...}"
+            call_pattern = r'"name"\s*:\s*"(\w+)"[^}]*"arguments"\s*:\s*"\{([^}]*)\}"'
+            call_matches = re.findall(call_pattern, calls_json)
+            
+            for name, args_inner in call_matches:
+                # 解析 arguments 内容（可能未转义）
+                # 例如: "query": "pattern", "path": "src/"
+                args = {}
+                kv_pattern = r'"(\w+)"\s*:\s*"([^"]*)"'
+                for key, value in re.findall(kv_pattern, args_inner):
+                    args[key] = value
+                
+                if name and args:
+                    tool_calls.append({
+                        "id": f"call_{len(tool_calls)+1}",
+                        "name": name,
+                        "arguments": args
+                    })
         
         return tool_calls[:8]  # 最多 8 个并行调用
     
