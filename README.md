@@ -148,8 +148,8 @@ LightningGrep/
 
 | 阶段 | 内容 | 状态 |
 |------|------|------|
-| **V1** | 数据合成 + SFT | 🔄 进行中 |
-| **V2** | SWE-Bench RL | ⏳ 待开始 |
+| **V1** | 数据合成 + SFT | ✅ 完成 |
+| **V2** | SWE-Bench RL | 🔄 进行中 |
 
 ### V1 进度
 
@@ -157,9 +157,16 @@ LightningGrep/
 - [x] 数据合成脚本（DeepSeek-V3）
 - [x] 断点续传支持
 - [x] 分布式合成支持
-- [ ] 合成 1000+ 条 SFT 数据（⏳ 进行中...）
-- [ ] QLoRA SFT 训练
-- [ ] 评测
+- [x] 合成 1000+ 条 SFT 数据
+- [x] QLoRA SFT 训练（A100 80G，~1小时）
+- [x] Sanity check（格式 + 并行调用验证）
+
+### V2 进度
+
+- [ ] SWE-Bench 数据预处理
+- [ ] RL 训练环境搭建
+- [ ] GRPO/PPO 训练
+- [ ] 端到端评测（Weighted F1）
 
 ## 📊 数据格式
 

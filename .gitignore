@@ -46,7 +46,11 @@ data/code_search/*.json
 !data/*/.gitkeep
 
 # Model outputs
-outputs/
+
+!outputs/.gitkeep
+!outputs/*/adapter_config.json
+!outputs/*/tokenizer*.json
+!outputs/*/added_tokens.json
 checkpoints/
 *.pt
 *.pth
@@ -72,3 +76,8 @@ Thumbs.db
 *.tmp
 *.temp
 .cache/
+quick_test.py
+
+# Model outputs (large files)
+outputs/
+!outputs/.gitkeep
