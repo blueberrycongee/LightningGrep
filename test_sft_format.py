@@ -106,9 +106,9 @@ prompt = format_sft_prompt(messages, tools=TOOLS_DEFINITION)
 inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 print(f"Prompt tokens: {inputs.input_ids.shape[1]}")
 
-print("\n生成中 (temperature=0, greedy)...")
+print("\n生成中 (temperature=0.7)...")
 with torch.no_grad():
-    outputs = model.generate(**inputs, max_new_tokens=500, do_sample=False, pad_token_id=tokenizer.pad_token_id)
+    outputs = model.generate(**inputs, max_new_tokens=500, temperature=0.7, do_sample=True, pad_token_id=tokenizer.pad_token_id)
 
 response = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=False)
 print(f"生成 tokens: {len(outputs[0]) - inputs.input_ids.shape[1]}")
@@ -116,3 +116,59 @@ print("=" * 60)
 print("模型输出:")
 print("=" * 60)
 print(response)
+
+# 测试解析
+print("\n" + "=" * 60)
+print("容错解析测试:")
+print("=" * 60)
+
+import re
+
+def parse_tool_calls(response):
+    tool_calls = []
+    pattern = r'<tool_calls>\s*(.*?)\s*</tool_calls>'
+    matches = re.findall(pattern, response, re.DOTALL)
+    
+    for calls_json in matches:
+        calls_json = calls_json.strip()
+        
+        # 方法1：尝试直接解析
+        try:
+            calls = json.loads(calls_json)
+            if isinstance(calls, list):
+                for call in calls:
+                    if "function" in call:
+                        func = call["function"]
+                        name = func.get("name", "")
+                        args_str = func.get("arguments", "{}")
+                        try:
+                            args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                        except:
+                            args = {}
+                        tool_calls.append({"name": name, "arguments": args})
+            continue
+        except json.JSONDecodeError:
+            pass
+        
+        # 方法2：容错解析
+        call_pattern = r'"name"\s*:\s*"(\w+)"[^}]*"arguments"\s*:\s*"\{([^}]*)\}"'
+        call_matches = re.findall(call_pattern, calls_json)
+        
+        for name, args_inner in call_matches:
+            args = {}
+            kv_pattern = r'"(\w+)"\s*:\s*"([^"]*)"'
+            for key, value in re.findall(kv_pattern, args_inner):
+                args[key] = value
+            
+            if name and args:
+                tool_calls.append({"name": name, "arguments": args})
+    
+    return tool_calls
+
+result = parse_tool_calls(response)
+if result:
+    print(f"✅ 解析成功! {len(result)} 个工具调用:")
+    for tc in result:
+        print(f"  - {tc['name']}: {tc['arguments']}")
+else:
+    print("❌ 解析失败，没有提取到工具调用")
