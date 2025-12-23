@@ -478,7 +478,7 @@ class Trajectory:
     files_found: List[str]
     ground_truth: List[str]
     reward: float
-    token_log_probs: List[torch.Tensor]  # 每轮生成的 token log probs
+    turn_data: List[Dict]          # 每轮的 input_ids 和 generated_ids（用于后续计算 log_prob）
     total_tokens: int              # 总 token 数
     tool_calls_count: int          # 工具调用总数
     turns: int                     # 实际轮数
@@ -695,28 +695,8 @@ Find the relevant files and code locations. After exploring with tools, provide 
             # 使用 <answer> 的内容计算 reward
             reward = compute_answer_reward(final_answer, ground_truth_files, ground_truth_lines, beta=0.5)
         
-        # 计算 log_prob（需要梯度）
-        # 对每轮生成做 forward pass，计算 token-level log_prob
-        token_log_probs = []
-        if not format_error and turn_data:
-            for data in turn_data:
-                input_ids = data["input_ids"]
-                generated_ids = data["generated_ids"]
-                input_len = input_ids.shape[1]
-                
-                # 拼接完整序列
-                full_ids = torch.cat([input_ids[0], generated_ids]).unsqueeze(0)
-                
-                # Forward pass 计算 logits
-                logits = self.model(full_ids).logits
-                
-                # 取生成部分的 log_prob
-                # logits[i] 预测 token[i+1]
-                gen_logits = logits[0, input_len-1:-1, :]
-                log_probs = torch.nn.functional.log_softmax(gen_logits, dim=-1)
-                tgt_log_probs = log_probs.gather(1, generated_ids.unsqueeze(1)).squeeze(1)
-                
-                token_log_probs.append(tgt_log_probs)
+        # 注意：log_prob 在 train_step 中计算，这里只保存 turn_data
+        # 这样确保在 train 模式下计算梯度
         
         return Trajectory(
             instance_id=instance["instance_id"],
@@ -725,12 +705,12 @@ Find the relevant files and code locations. After exploring with tools, provide 
             files_found=list(env.files_found),
             ground_truth=ground_truth_files,
             reward=reward,
-            token_log_probs=token_log_probs,
+            turn_data=turn_data,  # 保存用于后续计算 log_prob
             total_tokens=total_tokens,
             tool_calls_count=tool_calls_count,
             turns=actual_turns,
             format_error=format_error,
-            submitted_answer=final_answer,  # <answer> 解析的结果
+            submitted_answer=final_answer,
         )
     
     def _parse_tool_calls(self, response: str) -> List[Dict]:
@@ -794,7 +774,7 @@ Find the relevant files and code locations. After exploring with tools, provide 
         # 2. 过滤有效轨迹（博客: mask from loss）
         valid_trajectories = [
             t for t in all_trajectories 
-            if not t.format_error and t.token_log_probs and t.total_tokens <= self.max_traj_length
+            if not t.format_error and t.turn_data and t.total_tokens <= self.max_traj_length
         ]
         
         if not valid_trajectories:
@@ -817,16 +797,13 @@ Find the relevant files and code locations. After exploring with tools, provide 
         else:
             advantages = rewards - rewards.mean()
         
-        # 5. 按工具调用数 scaling（博客: scale by average tool calls）
-        if self.scale_by_tool_calls:
-            scales = []
-            for t in valid_trajectories:
-                avg_calls = t.tool_calls_count / max(t.turns, 1)
-                # 工具调用越多，scale 越小（鼓励高效使用）
-                scale = 1.0 / max(avg_calls, 1.0)
-                scales.append(scale)
-            scales = torch.tensor(scales, device=self.model.device, dtype=torch.float32)
-            advantages = advantages * scales
+        # 5. 按 token 数 normalize（替代按工具调用数 scaling，更稳定）
+        # 这样长轨迹和短轨迹的梯度贡献更均衡
+        token_counts = torch.tensor(
+            [t.total_tokens for t in valid_trajectories],
+            device=self.model.device,
+            dtype=torch.float32
+        )
         
         # 6. 标准化 advantages
         if len(advantages) > 1 and advantages.std() > 1e-8:
@@ -834,16 +811,35 @@ Find the relevant files and code locations. After exploring with tools, provide 
         
         advantages = advantages.detach()
         
-        # 7. 计算 Policy Gradient Loss
+        # 7. 切换到 train 模式，计算 log_prob 和 loss
         self.model.train()
         total_loss = torch.tensor(0.0, device=self.model.device, requires_grad=True)
         
-        for traj, advantage in zip(valid_trajectories, advantages):
-            # 合并所有轮次的 token log_probs
-            # log π(trajectory) = sum_t log π(a_t|s_t)
-            traj_log_prob = torch.cat([lp for lp in traj.token_log_probs]).sum()
+        for traj, advantage, num_tokens in zip(valid_trajectories, advantages, token_counts):
+            # 在 train 模式下计算 log_prob
+            traj_log_prob = torch.tensor(0.0, device=self.model.device, requires_grad=True)
+            
+            for data in traj.turn_data:
+                input_ids = data["input_ids"]
+                generated_ids = data["generated_ids"]
+                input_len = input_ids.shape[1]
+                
+                # 拼接完整序列
+                full_ids = torch.cat([input_ids[0], generated_ids]).unsqueeze(0)
+                
+                # Forward pass 计算 logits（在 train 模式下）
+                logits = self.model(full_ids).logits
+                
+                # 取生成部分的 log_prob
+                gen_logits = logits[0, input_len-1:-1, :]
+                log_probs = torch.nn.functional.log_softmax(gen_logits, dim=-1)
+                token_log_probs = log_probs.gather(1, generated_ids.unsqueeze(1)).squeeze(1)
+                
+                # 使用 mean 而不是 sum，避免溢出
+                traj_log_prob = traj_log_prob + token_log_probs.mean()
             
             # REINFORCE: -A * log π
+            # 使用 mean log_prob，不需要再按 token 数 normalize
             loss = -advantage * traj_log_prob
             total_loss = total_loss + loss
         
