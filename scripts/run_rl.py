@@ -180,7 +180,11 @@ class RepoManager:
         return repo_path
     
     def _clone_repo(self, repo: str, repo_path: Path):
-        """克隆仓库（支持镜像和重试）"""
+        """克隆仓库（支持镜像和重试，显示进度）"""
+        import shutil
+        import time
+        import re
+        
         # GitHub 镜像列表（国内优先）
         mirrors = [
             f"https://ghproxy.com/https://github.com/{repo}.git",  # ghproxy 镜像（默认）
@@ -188,38 +192,84 @@ class RepoManager:
             f"https://github.com/{repo}.git",  # 原始 GitHub（最后尝试）
         ]
         
+        mirror_names = ["ghproxy镜像", "gitclone镜像", "GitHub原始"]
+        
         print(f"  克隆仓库: {repo}...")
         
         for i, url in enumerate(mirrors):
+            mirror_name = mirror_names[i] if i < len(mirror_names) else f"镜像{i}"
+            if i > 0:
+                print(f"  尝试 {mirror_name}...")
+            
+            # 清理之前失败的目录
+            if repo_path.exists():
+                shutil.rmtree(repo_path, ignore_errors=True)
+            
             try:
-                mirror_names = ["ghproxy镜像", "gitclone镜像", "GitHub原始"]
-                mirror_name = mirror_names[i] if i < len(mirror_names) else f"镜像{i}"
-                if i > 0:
-                    print(f"  尝试 {mirror_name}...")
-                
-                subprocess.run(
-                    ["git", "clone", "--depth", "100", url, str(repo_path)],
-                    check=True,
-                    capture_output=True,
-                    timeout=300,  # 5分钟超时
+                # 使用 Popen 实时显示进度
+                process = subprocess.Popen(
+                    ["git", "clone", "--depth", "100", "--progress", url, str(repo_path)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
                 )
-                print(f"  ✅ 克隆成功")
-                return  # 成功就返回
                 
+                start_time = time.time()
+                last_print_time = 0
+                
+                # 实时读取 stderr（git 进度信息在 stderr）
+                while True:
+                    # 非阻塞读取
+                    line = process.stderr.readline()
+                    if not line and process.poll() is not None:
+                        break
+                    
+                    if line:
+                        line = line.strip()
+                        # 解析进度信息
+                        # 格式: "Receiving objects:  45% (1234/2745), 12.50 MiB | 1.25 MiB/s"
+                        if "Receiving" in line or "Compressing" in line or "Resolving" in line:
+                            current_time = time.time()
+                            # 每秒最多更新一次
+                            if current_time - last_print_time >= 0.5:
+                                # 提取百分比和速度
+                                match = re.search(r'(\d+)%.*?\|\s*([\d.]+\s*\w+/s)', line)
+                                if match:
+                                    percent = match.group(1)
+                                    speed = match.group(2)
+                                    elapsed = int(current_time - start_time)
+                                    print(f"\r    进度: {percent}% | 速度: {speed} | 耗时: {elapsed}s", end="", flush=True)
+                                else:
+                                    # 没有速度信息，只显示百分比
+                                    match = re.search(r'(\d+)%', line)
+                                    if match:
+                                        percent = match.group(1)
+                                        elapsed = int(current_time - start_time)
+                                        print(f"\r    进度: {percent}% | 耗时: {elapsed}s", end="", flush=True)
+                                last_print_time = current_time
+                
+                # 等待进程结束
+                return_code = process.wait(timeout=300)
+                print()  # 换行
+                
+                if return_code == 0:
+                    elapsed = int(time.time() - start_time)
+                    print(f"  ✅ 克隆成功 (耗时 {elapsed}s)")
+                    return
+                else:
+                    stderr = process.stderr.read()
+                    print(f"  ⚠️ 失败: {stderr[:100]}...")
+                    
             except subprocess.TimeoutExpired:
-                print(f"  ⚠️ 超时，尝试下一个镜像...")
-                # 清理失败的目录
+                process.kill()
+                print(f"\n  ⚠️ 超时 (>5分钟)，尝试下一个镜像...")
                 if repo_path.exists():
-                    import shutil
                     shutil.rmtree(repo_path, ignore_errors=True)
                 continue
                 
-            except subprocess.CalledProcessError as e:
-                error_msg = e.stderr.decode() if e.stderr else str(e)
-                print(f"  ⚠️ 失败: {error_msg[:100]}...")
-                # 清理失败的目录
+            except Exception as e:
+                print(f"\n  ⚠️ 异常: {str(e)[:100]}...")
                 if repo_path.exists():
-                    import shutil
                     shutil.rmtree(repo_path, ignore_errors=True)
                 continue
         
@@ -588,7 +638,7 @@ Directory structure:
 ```
 
 Issue:
-{instance["problem_statement"]}
+{instance.get("problem_statement") or instance.get("query", "")}
 
 Find the relevant files and code locations. After exploring with tools, provide your answer in the <answer> format."""
         
@@ -618,10 +668,11 @@ Find the relevant files and code locations. After exploring with tools, provide 
             input_ids = inputs["input_ids"]
             
             # 生成（不计算梯度）
+            # Qwen3 会先 <think> 思考，需要足够的 token 空间
             with torch.no_grad():
                 outputs = self.model.generate(
                     **inputs,
-                    max_new_tokens=512,
+                    max_new_tokens=2048,  # 增加以容纳思考 + 工具调用
                     temperature=self.temperature,
                     do_sample=True,
                     pad_token_id=self.tokenizer.pad_token_id,
@@ -630,6 +681,10 @@ Find the relevant files and code locations. After exploring with tools, provide 
             
             generated_ids = outputs.sequences[0][input_ids.shape[1]:]
             response = self.tokenizer.decode(generated_ids, skip_special_tokens=False)
+            
+            # 调试：打印模型输出
+            if hasattr(self, 'debug') and self.debug and turn == 0:
+                print(f"\n  [DEBUG] 模型输出 (前500字符):\n{response[:500]}\n")
             
             # 保存这轮的输入和生成（用于后续计算 log_prob）
             turn_data.append({
@@ -684,23 +739,24 @@ Find the relevant files and code locations. After exploring with tools, provide 
                 if answer:
                     final_answer = answer  # 取最后一个有效答案
         
-        # 检查是否有有效答案
-        if not final_answer:
-            format_error = True
-        
         # 计算 reward（博客: weighted F1, β=0.5）
         if format_error:
             reward = 0.0
-        else:
-            # 使用 <answer> 的内容计算 reward
+        elif final_answer:
+            # 有 <answer> 格式，使用它
             reward = compute_answer_reward(final_answer, ground_truth_files, ground_truth_lines, beta=0.5)
+        else:
+            # 没有 <answer>，使用隐式收集的结果（兼容模式）
+            # 这样模型可以逐渐学习
+            reward = env.compute_reward(ground_truth_files, ground_truth_lines, beta=0.5, use_submission=False)
         
         # 注意：log_prob 在 train_step 中计算，这里只保存 turn_data
         # 这样确保在 train 模式下计算梯度
         
+        problem = instance.get("problem_statement") or instance.get("query", "")
         return Trajectory(
             instance_id=instance["instance_id"],
-            query=instance["problem_statement"][:100],
+            query=problem[:100],
             messages=messages,
             files_found=list(env.files_found),
             ground_truth=ground_truth_files,
@@ -714,28 +770,37 @@ Find the relevant files and code locations. After exploring with tools, provide 
         )
     
     def _parse_tool_calls(self, response: str) -> List[Dict]:
-        """解析工具调用"""
+        """解析工具调用（支持多种格式）"""
         import re
         
         tool_calls = []
         
-        # 匹配 <tool_call>...</tool_call> 或 JSON
-        patterns = [
-            r'<tool_call>\s*(\{[^}]+\})\s*',
-            r'\{"name":\s*"(\w+)",\s*"arguments":\s*(\{[^}]+\})\}',
-        ]
+        # Qwen3 格式: <tool_call>{"name": "grep", "arguments": {...}}</tool_call>
+        # 也支持: {"name": "grep", "arguments": {...}}
         
-        for pattern in patterns:
-            matches = re.findall(pattern, response)
-            for match in matches:
+        # 先提取 </think> 后面的内容（如果有）
+        if '</think>' in response:
+            response = response.split('</think>', 1)[1]
+        
+        # 模式1: <tool_call>JSON</tool_call>
+        pattern1 = r'<tool_call>\s*(\{.*?\})\s*</tool_call>'
+        for match in re.finditer(pattern1, response, re.DOTALL):
+            try:
+                call = json.loads(match.group(1))
+                if "name" in call:
+                    tool_calls.append(call)
+            except json.JSONDecodeError:
+                continue
+        
+        # 模式2: 直接的 JSON 对象 {"name": "...", "arguments": {...}}
+        if not tool_calls:
+            pattern2 = r'\{\s*"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(\{[^}]*\})\s*\}'
+            for match in re.finditer(pattern2, response):
                 try:
-                    if isinstance(match, tuple):
-                        tool_calls.append({
-                            "name": match[0],
-                            "arguments": json.loads(match[1])
-                        })
-                    else:
-                        tool_calls.append(json.loads(match))
+                    tool_calls.append({
+                        "name": match.group(1),
+                        "arguments": json.loads(match.group(2))
+                    })
                 except json.JSONDecodeError:
                     continue
         
@@ -779,6 +844,10 @@ Find the relevant files and code locations. After exploring with tools, provide 
         
         if not valid_trajectories:
             avg_reward = sum(t.reward for t in all_trajectories) / len(all_trajectories)
+            # 调试：打印为什么没有有效轨迹
+            if hasattr(self, 'debug') and self.debug:
+                for i, t in enumerate(all_trajectories):
+                    print(f"  [DEBUG] 轨迹 {i}: format_error={t.format_error}, turn_data={len(t.turn_data)}, tokens={t.total_tokens}, reward={t.reward:.3f}")
             return {"loss": 0.0, "reward": avg_reward, "num_trajectories": len(all_trajectories), "valid": 0}
         
         # 3. 计算 rewards
@@ -996,6 +1065,7 @@ def main():
     
     # 数据
     parser.add_argument("--split", type=str, default="lite", choices=["lite", "full"], help="SWE-Bench 版本")
+    parser.add_argument("--data_file", type=str, default=None, help="自定义数据文件（覆盖 split）")
     parser.add_argument("--max_samples", type=int, default=100, help="最大训练样本数")
     
     # 训练参数
@@ -1060,7 +1130,13 @@ def main():
     
     # 1. 加载数据
     print("\n[1/4] 加载 SWE-Bench 数据...")
-    data = load_swebench_data(args.split)
+    if args.data_file:
+        # 使用自定义数据文件
+        print(f"  从自定义文件加载: {args.data_file}")
+        with open(args.data_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        data = load_swebench_data(args.split)
     
     # 限制样本数
     if args.max_samples and len(data) > args.max_samples:
