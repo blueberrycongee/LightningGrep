@@ -282,29 +282,53 @@ def reinforce_loss(
     tokenizer,
     device: str = "cuda",
     scale_by_tool_calls: bool = True,
+    max_trajectory_length: int = 4096,  # 屏蔽过长轨迹
 ) -> torch.Tensor:
     """
     计算 REINFORCE loss
-    L = -1/G * sum_j [ IS_ratio_j * A_j * sum_t log π(a_t|s_t) ]
+    L = -1/G * sum_j [ A_j * sum_t log π(a_t|s_t) ]
+    
+    SWE-grep 稳定性技巧:
+    - 格式错误的轨迹排除 (reward=0)
+    - 过长轨迹排除
+    - 按 tool calls 数量缩放 advantages
     """
     if not trajectories:
         return torch.tensor(0.0, device=device)
     
+    # 过滤有效轨迹 (SWE-grep: 格式错误给 0 reward 并排除)
+    valid_trajectories = [
+        t for t in trajectories 
+        if not t.format_error and t.log_probs
+    ]
+    
+    if not valid_trajectories:
+        return torch.tensor(0.0, device=device)
+    
+    # 过滤过长轨迹
+    filtered_trajectories = []
+    for t in valid_trajectories:
+        total_tokens = sum(lp.numel() for lp in t.log_probs)
+        if total_tokens <= max_trajectory_length:
+            filtered_trajectories.append(t)
+    
+    if not filtered_trajectories:
+        return torch.tensor(0.0, device=device)
+    
     # 计算 advantages (leave-one-out baseline)
-    rewards = [t.reward for t in trajectories]
+    rewards = [t.reward for t in filtered_trajectories]
     advantages = compute_advantages(rewards)
     
     total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    valid_count = 0
     
-    for traj, advantage in zip(trajectories, advantages):
-        if not traj.log_probs:
-            continue
-        
+    for traj, advantage in zip(filtered_trajectories, advantages):
         # 合并所有轮次的 log probs
         all_log_probs = torch.cat(traj.log_probs)
         trajectory_log_prob = all_log_probs.sum()
         
         # 按 tool calls 数量缩放 (SWE-grep 的技巧)
+        # 鼓励模型先学会有效使用少量工具调用
         if scale_by_tool_calls and traj.tool_calls_count > 0:
             avg_calls_per_turn = traj.tool_calls_count / max(traj.turns, 1)
             scale = 1.0 / max(avg_calls_per_turn, 1.0)
@@ -314,8 +338,12 @@ def reinforce_loss(
         # REINFORCE: -advantage * log_prob
         loss = -advantage * scale * trajectory_log_prob
         total_loss = total_loss + loss
+        valid_count += 1
     
-    return total_loss / len(trajectories)
+    if valid_count == 0:
+        return torch.tensor(0.0, device=device)
+    
+    return total_loss / valid_count
 
 
 class RLTrainer:
