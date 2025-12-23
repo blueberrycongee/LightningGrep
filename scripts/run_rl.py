@@ -237,17 +237,56 @@ class RepoManager:
             )
         except subprocess.CalledProcessError:
             # 可能需要 fetch 更多历史
-            subprocess.run(
+            print(f"    commit 不在浅克隆中，尝试获取完整历史...")
+            
+            # 方法1: unshallow
+            result = subprocess.run(
                 ["git", "fetch", "--unshallow"],
                 cwd=repo_path,
                 capture_output=True,
             )
-            subprocess.run(
-                ["git", "checkout", commit],
-                cwd=repo_path,
-                check=True,
-                capture_output=True,
-            )
+            
+            # 方法2: 如果 unshallow 失败，尝试 fetch 特定 commit
+            if result.returncode != 0:
+                subprocess.run(
+                    ["git", "fetch", "origin", commit],
+                    cwd=repo_path,
+                    capture_output=True,
+                )
+            
+            # 再次尝试 checkout
+            try:
+                subprocess.run(
+                    ["git", "checkout", commit],
+                    cwd=repo_path,
+                    check=True,
+                    capture_output=True,
+                )
+            except subprocess.CalledProcessError as e:
+                # 最后尝试：完全重新克隆（不用浅克隆）
+                print(f"    ⚠️ 无法 checkout {commit[:12]}，尝试完整克隆...")
+                import shutil
+                repo_name = repo_path.name
+                repo = repo_name.replace("__", "/")
+                shutil.rmtree(repo_path, ignore_errors=True)
+                self.cloned_repos.discard(repo_name)
+                
+                # 完整克隆（不用 --depth）
+                subprocess.run(
+                    ["git", "clone", f"https://github.com/{repo}.git", str(repo_path)],
+                    check=True,
+                    capture_output=True,
+                    timeout=600,
+                )
+                self.cloned_repos.add(repo_name)
+                
+                # 最后一次尝试
+                subprocess.run(
+                    ["git", "checkout", commit],
+                    cwd=repo_path,
+                    check=True,
+                    capture_output=True,
+                )
 
 
 # ========== 奖励计算（使用 env.compute_reward，支持文件+行级 F1）==========
@@ -298,21 +337,37 @@ def get_repo_tree(repo_path: Path, max_depth: int = 2, max_items: int = 50) -> s
     return "\n".join(lines)
 
 
-# ========== 简化版 RL 训练 ==========
+# ========== SWE-grep 风格 RL 训练 ==========
+# 完整实现 Cognition/Windsurf 博客描述的技术
 
 @dataclass
 class Trajectory:
     """一条搜索轨迹"""
     instance_id: str
     query: str
+    messages: List[Dict]           # 完整对话历史
     files_found: List[str]
     ground_truth: List[str]
     reward: float
-    log_prob: float
+    token_log_probs: List[torch.Tensor]  # 每轮生成的 token log probs
+    total_tokens: int              # 总 token 数
+    tool_calls_count: int          # 工具调用总数
+    turns: int                     # 实际轮数
+    format_error: bool = False     # 是否有格式错误
 
 
-class SimpleRLTrainer:
-    """简化版 REINFORCE 训练器"""
+class SWEGrepTrainer:
+    """
+    SWE-grep 风格的 REINFORCE 训练器
+    
+    完整实现博客提到的技术：
+    1. 4 turns × 8 parallel tool calls
+    2. Weighted F1 (β=0.5) reward
+    3. Per-sequence importance sampling (简化版)
+    4. Leave-one-out baseline
+    5. 按工具调用数 scaling advantage
+    6. 格式错误/过长轨迹 mask from loss
+    """
     
     def __init__(
         self,
@@ -320,66 +375,61 @@ class SimpleRLTrainer:
         tokenizer,
         repo_manager: RepoManager,
         learning_rate: float = 1e-5,
-        num_rollouts: int = 4,
-        max_turns: int = 3,
+        num_rollouts: int = 4,      # 博客: g completions from same prompt
+        max_turns: int = 4,          # 博客: 4 turns (3 exploration + 1 answer)
+        max_parallel_calls: int = 8, # 博客: up to 8 parallel tool calls
         temperature: float = 0.7,
+        max_traj_length: int = 4096, # 博客: T_max
+        grad_clip: float = 1.0,
+        scale_by_tool_calls: bool = True,  # 博客: scaling advantages
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.repo_manager = repo_manager
         self.num_rollouts = num_rollouts
         self.max_turns = max_turns
+        self.max_parallel_calls = max_parallel_calls
         self.temperature = temperature
+        self.max_traj_length = max_traj_length
+        self.grad_clip = grad_clip
+        self.scale_by_tool_calls = scale_by_tool_calls
         
         self.optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=learning_rate,
         )
+        
+        # 统计
+        self.total_steps = 0
+        self.reward_history = []
     
-    def generate_response(self, messages: List[Dict]) -> str:
-        """生成模型响应"""
-        prompt = self.tokenizer.apply_chat_template(
-            messages,
-            tools=TOOLS_DEFINITION,
-            add_generation_prompt=True,
-            tokenize=False,
-        )
+    def collect_trajectory(self, instance: Dict) -> Trajectory:
+        """
+        收集一条轨迹（不计算梯度，只采样）
         
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-        
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=512,
-                temperature=self.temperature,
-                do_sample=True,
-                pad_token_id=self.tokenizer.pad_token_id,
-            )
-        
-        response = self.tokenizer.decode(
-            outputs[0][inputs["input_ids"].shape[1]:],
-            skip_special_tokens=False
-        )
-        
-        return response
-    
-    def run_episode(self, instance: Dict) -> Trajectory:
-        """运行一个 episode"""
+        博客方法：先采样轨迹，记录 token ids，之后统一计算 log_prob
+        """
         repo_path = self.repo_manager.get_repo_path(
             instance["repo"],
             instance["base_commit"]
         )
         
-        env = CodeSearchEnv(str(repo_path), max_turns=self.max_turns)
+        env = CodeSearchEnv(
+            str(repo_path), 
+            max_turns=self.max_turns,
+            max_parallel_calls=self.max_parallel_calls
+        )
         
-        # 解析 ground truth（文件 + 行）
         ground_truth_files = parse_patch_files(instance["patch"])
         ground_truth_lines = parse_patch_lines(instance["patch"])
-        
-        # 获取仓库目录结构（主代理提前分析好，传给子代理）
         repo_tree = get_repo_tree(repo_path)
         
-        # 构建 prompt：目录结构 + Issue
+        # System prompt + User query
+        system_prompt = """You are a code search agent. Your task is to find relevant files and code locations.
+Use the available tools (grep, read, glob, find) to search the codebase.
+You can make up to 8 parallel tool calls per turn.
+After searching, provide the relevant file paths and line ranges."""
+        
         user_prompt = f"""Repository: {instance["repo"]}
 
 Directory structure:
@@ -392,20 +442,68 @@ Issue:
 
 Find the relevant files and code locations for this issue."""
         
-        # 初始消息
-        messages = [{"role": "user", "content": user_prompt}]
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
         
-        total_log_prob = 0.0
+        # 收集每轮的信息
+        turn_data = []  # [(input_ids, generated_ids), ...]
+        total_tokens = 0
+        tool_calls_count = 0
+        format_error = False
+        actual_turns = 0
         
         for turn in range(self.max_turns):
-            # 生成响应
-            response = self.generate_response(messages)
+            actual_turns = turn + 1
+            
+            # 构建输入
+            prompt = self.tokenizer.apply_chat_template(
+                messages,
+                tools=TOOLS_DEFINITION,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+            input_ids = inputs["input_ids"]
+            
+            # 生成（不计算梯度）
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=512,
+                    temperature=self.temperature,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    return_dict_in_generate=True,
+                )
+            
+            generated_ids = outputs.sequences[0][input_ids.shape[1]:]
+            response = self.tokenizer.decode(generated_ids, skip_special_tokens=False)
+            
+            # 保存这轮的输入和生成（用于后续计算 log_prob）
+            turn_data.append({
+                "input_ids": input_ids.clone(),
+                "generated_ids": generated_ids.clone(),
+            })
+            total_tokens += len(generated_ids)
+            
+            # 检查是否超长（博客: mask overlong trajectories）
+            if total_tokens > self.max_traj_length:
+                format_error = True
+                break
             
             # 解析 tool calls
             tool_calls = self._parse_tool_calls(response)
             
+            # 检查格式（博客: incorrectly formatted tool call → 0 reward）
             if not tool_calls:
+                if turn < self.max_turns - 1:
+                    # 非最后一轮没有 tool call = 格式错误
+                    format_error = True
                 break
+            
+            tool_calls_count += len(tool_calls)
             
             # 执行 tool calls
             results, done = env.step(tool_calls)
@@ -418,16 +516,47 @@ Find the relevant files and code locations for this issue."""
             if done:
                 break
         
-        # 计算奖励（文件 + 行级 F1 的平均）
-        reward = env.compute_reward(ground_truth_files, ground_truth_lines)
+        # 计算 reward（博客: weighted F1, β=0.5）
+        if format_error:
+            reward = 0.0
+        else:
+            reward = env.compute_reward(ground_truth_files, ground_truth_lines, beta=0.5)
+        
+        # 计算 log_prob（需要梯度）
+        # 对每轮生成做 forward pass，计算 token-level log_prob
+        token_log_probs = []
+        if not format_error and turn_data:
+            for data in turn_data:
+                input_ids = data["input_ids"]
+                generated_ids = data["generated_ids"]
+                input_len = input_ids.shape[1]
+                
+                # 拼接完整序列
+                full_ids = torch.cat([input_ids[0], generated_ids]).unsqueeze(0)
+                
+                # Forward pass 计算 logits
+                logits = self.model(full_ids).logits
+                
+                # 取生成部分的 log_prob
+                # logits[i] 预测 token[i+1]
+                gen_logits = logits[0, input_len-1:-1, :]
+                log_probs = torch.nn.functional.log_softmax(gen_logits, dim=-1)
+                tgt_log_probs = log_probs.gather(1, generated_ids.unsqueeze(1)).squeeze(1)
+                
+                token_log_probs.append(tgt_log_probs)
         
         return Trajectory(
             instance_id=instance["instance_id"],
             query=instance["problem_statement"][:100],
+            messages=messages,
             files_found=list(env.files_found),
             ground_truth=ground_truth_files,
             reward=reward,
-            log_prob=total_log_prob,
+            token_log_probs=token_log_probs,
+            total_tokens=total_tokens,
+            tool_calls_count=tool_calls_count,
+            turns=actual_turns,
+            format_error=format_error,
         )
     
     def _parse_tool_calls(self, response: str) -> List[Dict]:
@@ -459,33 +588,120 @@ Find the relevant files and code locations for this issue."""
         return tool_calls[:8]  # 最多 8 个并行调用
     
     def train_step(self, instances: List[Dict]) -> Dict:
-        """一步训练"""
+        """
+        一步训练（博客: REINFORCE with per-sequence importance sampling）
+        
+        博客公式:
+        L = sum_j [ A_j * sum_t log π(a_t|s_t) ]
+        其中 A_j = R_j - baseline_j (leave-one-out)
+        
+        稳定性技巧:
+        1. 格式错误轨迹 mask from loss
+        2. 过长轨迹 mask from loss  
+        3. 按工具调用数 scaling advantages
+        4. 梯度裁剪
+        """
         all_trajectories = []
         
+        # 1. 收集轨迹（采样阶段，不需要梯度）
+        self.model.eval()
         for instance in instances:
             for _ in range(self.num_rollouts):
                 try:
-                    traj = self.run_episode(instance)
+                    traj = self.collect_trajectory(instance)
                     all_trajectories.append(traj)
                 except Exception as e:
                     print(f"  ⚠️ Episode 失败: {e}")
                     continue
         
         if not all_trajectories:
-            return {"loss": 0, "reward": 0}
+            return {"loss": 0.0, "reward": 0.0, "num_trajectories": 0}
         
-        # 计算 baseline (mean reward)
-        rewards = [t.reward for t in all_trajectories]
-        baseline = sum(rewards) / len(rewards)
+        # 2. 过滤有效轨迹（博客: mask from loss）
+        valid_trajectories = [
+            t for t in all_trajectories 
+            if not t.format_error and t.token_log_probs and t.total_tokens <= self.max_traj_length
+        ]
         
-        # REINFORCE 更新 (简化版)
-        # 这里只返回统计信息，实际梯度更新需要更复杂的实现
+        if not valid_trajectories:
+            avg_reward = sum(t.reward for t in all_trajectories) / len(all_trajectories)
+            return {"loss": 0.0, "reward": avg_reward, "num_trajectories": len(all_trajectories), "valid": 0}
+        
+        # 3. 计算 rewards
+        rewards = torch.tensor(
+            [t.reward for t in valid_trajectories], 
+            device=self.model.device,
+            dtype=torch.float32
+        )
+        
+        # 4. Leave-one-out baseline（博客公式）
+        n = len(rewards)
+        if n > 1:
+            total_reward = rewards.sum()
+            baselines = (total_reward - rewards) / (n - 1)
+            advantages = rewards - baselines
+        else:
+            advantages = rewards - rewards.mean()
+        
+        # 5. 按工具调用数 scaling（博客: scale by average tool calls）
+        if self.scale_by_tool_calls:
+            scales = []
+            for t in valid_trajectories:
+                avg_calls = t.tool_calls_count / max(t.turns, 1)
+                # 工具调用越多，scale 越小（鼓励高效使用）
+                scale = 1.0 / max(avg_calls, 1.0)
+                scales.append(scale)
+            scales = torch.tensor(scales, device=self.model.device, dtype=torch.float32)
+            advantages = advantages * scales
+        
+        # 6. 标准化 advantages
+        if len(advantages) > 1 and advantages.std() > 1e-8:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        advantages = advantages.detach()
+        
+        # 7. 计算 Policy Gradient Loss
+        self.model.train()
+        total_loss = torch.tensor(0.0, device=self.model.device, requires_grad=True)
+        
+        for traj, advantage in zip(valid_trajectories, advantages):
+            # 合并所有轮次的 token log_probs
+            # log π(trajectory) = sum_t log π(a_t|s_t)
+            traj_log_prob = torch.cat([lp for lp in traj.token_log_probs]).sum()
+            
+            # REINFORCE: -A * log π
+            loss = -advantage * traj_log_prob
+            total_loss = total_loss + loss
+        
+        total_loss = total_loss / len(valid_trajectories)
+        
+        # 8. 反向传播
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        
+        # 9. 梯度裁剪（博客: 稳定性）
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+        
+        # 10. 更新参数
+        self.optimizer.step()
+        
+        self.total_steps += 1
+        
+        # 统计
+        all_rewards = [t.reward for t in all_trajectories]
+        format_error_rate = sum(1 for t in all_trajectories if t.format_error) / len(all_trajectories)
+        avg_tool_calls = sum(t.tool_calls_count for t in all_trajectories) / len(all_trajectories)
         
         return {
-            "loss": 0,
-            "reward": sum(rewards) / len(rewards),
-            "baseline": baseline,
+            "loss": total_loss.item(),
+            "reward": sum(all_rewards) / len(all_rewards),
+            "reward_valid": rewards.mean().item(),
+            "baseline": baselines.mean().item() if n > 1 else 0.0,
             "num_trajectories": len(all_trajectories),
+            "valid_trajectories": len(valid_trajectories),
+            "format_error_rate": format_error_rate,
+            "avg_tool_calls": avg_tool_calls,
+            "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
         }
     
     def train(
@@ -499,11 +715,23 @@ Find the relevant files and code locations for this issue."""
         start_step: int = 0,
     ):
         """训练循环"""
+        from datetime import datetime
+        
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         
-        # 日志文件
-        log_file = output_path / "training_log.jsonl"
+        # 日志文件（按时间戳区分，避免覆盖）
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if start_step == 0:
+            # 新训练：创建新的日志文件
+            log_file = output_path / f"training_log_{timestamp}.jsonl"
+        else:
+            # 继续训练：找最新的日志文件或创建新的
+            existing_logs = list(output_path.glob("training_log_*.jsonl"))
+            if existing_logs:
+                log_file = max(existing_logs, key=lambda x: x.stat().st_mtime)
+            else:
+                log_file = output_path / f"training_log_{timestamp}.jsonl"
         
         print(f"\n开始 RL 训练: {num_steps} steps (从 step {start_step} 开始)")
         print(f"  Batch size: {batch_size}")
@@ -529,16 +757,22 @@ Find the relevant files and code locations for this issue."""
             pbar.update(1)
             pbar.set_postfix({
                 "reward": f"{stats['reward']:.3f}",
-                "avg": f"{total_reward/(step-start_step):.3f}",
+                "loss": f"{stats.get('loss', 0):.4f}",
+                "valid": stats.get("valid_trajectories", 0),
             })
             
-            # 记录日志
+            # 记录日志（完整统计信息）
             log_entry = {
                 "step": step,
                 "reward": stats["reward"],
+                "reward_valid": stats.get("reward_valid", stats["reward"]),
                 "avg_reward": total_reward / (step - start_step),
                 "loss": stats.get("loss", 0),
                 "num_trajectories": stats.get("num_trajectories", 0),
+                "valid_trajectories": stats.get("valid_trajectories", 0),
+                "format_error_rate": stats.get("format_error_rate", 0),
+                "avg_tool_calls": stats.get("avg_tool_calls", 0),
+                "grad_norm": stats.get("grad_norm", 0),
             }
             with open(log_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(log_entry) + "\n")
@@ -783,14 +1017,18 @@ def main():
         else:
             print(f"  ⚠️ 未找到 train_state.json，从头开始")
     
-    trainer = SimpleRLTrainer(
+    trainer = SWEGrepTrainer(
         model=model,
         tokenizer=tokenizer,
         repo_manager=repo_manager,
         learning_rate=args.learning_rate,
         num_rollouts=args.num_rollouts,
         max_turns=args.max_turns,
+        max_parallel_calls=args.max_parallel_calls,
         temperature=args.temperature,
+        max_traj_length=args.max_traj_length,
+        grad_clip=args.grad_clip,
+        scale_by_tool_calls=args.scale_by_tool_calls,
     )
     
     # 加载 optimizer 状态

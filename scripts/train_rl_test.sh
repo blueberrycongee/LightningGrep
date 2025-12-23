@@ -20,18 +20,22 @@ python scripts/run_rl.py \
     --batch_size 2 \
     --num_rollouts 4 \
     --max_turns 4 \
+    --max_parallel_calls 8 \
     --temperature 0.7 \
     --learning_rate 5e-6 \
-    --quantization 4bit \
+    --quantization none \
     --dtype bf16 \
     --lora_r 16 \
     --lora_alpha 32 \
+    --grad_clip 1.0 \
+    --max_traj_length 4096 \
+    --scale_by_tool_calls \
     --debug \
     --save_every 20
 
 echo ""
 echo "============================================"
 echo "测试完成！检查结果："
-echo "1. 查看日志: cat outputs/rl_test/training_log.jsonl"
-echo "2. 如果 reward 有上升，运行: bash scripts/train_rl_full.sh"
+echo "1. 查看日志: cat outputs/rl_test/training_log_*.jsonl"
+echo "2. 如果 reward 有上升且 loss 不为 0，运行: bash scripts/train_rl_full.sh"
 echo "============================================"
