@@ -183,6 +183,51 @@ class RepoManager:
 # ========== 奖励计算（使用 env.compute_reward，支持文件+行级 F1）==========
 
 
+def get_repo_tree(repo_path: Path, max_depth: int = 2, max_items: int = 50) -> str:
+    """
+    获取仓库目录结构（用于 prompt）
+    
+    主代理会先分析仓库结构，然后传给子代理
+    """
+    lines = []
+    count = [0]  # 用列表来在闭包中修改
+    
+    def walk(path: Path, prefix: str = "", depth: int = 0):
+        if depth > max_depth or count[0] >= max_items:
+            return
+        
+        try:
+            items = sorted(path.iterdir(), key=lambda x: (x.is_file(), x.name))
+        except PermissionError:
+            return
+        
+        # 过滤掉常见的无关目录
+        skip_dirs = {'.git', '__pycache__', 'node_modules', '.venv', 'venv', '.tox', 'dist', 'build', '.eggs'}
+        items = [x for x in items if x.name not in skip_dirs]
+        
+        for i, item in enumerate(items):
+            if count[0] >= max_items:
+                lines.append(f"{prefix}... (truncated)")
+                return
+            
+            is_last = (i == len(items) - 1)
+            connector = "└── " if is_last else "├── "
+            
+            if item.is_dir():
+                lines.append(f"{prefix}{connector}{item.name}/")
+                count[0] += 1
+                new_prefix = prefix + ("    " if is_last else "│   ")
+                walk(item, new_prefix, depth + 1)
+            else:
+                lines.append(f"{prefix}{connector}{item.name}")
+                count[0] += 1
+    
+    lines.append(f"{repo_path.name}/")
+    walk(repo_path)
+    
+    return "\n".join(lines)
+
+
 # ========== 简化版 RL 训练 ==========
 
 @dataclass
@@ -261,8 +306,24 @@ class SimpleRLTrainer:
         ground_truth_files = parse_patch_files(instance["patch"])
         ground_truth_lines = parse_patch_lines(instance["patch"])
         
+        # 获取仓库目录结构（主代理提前分析好，传给子代理）
+        repo_tree = get_repo_tree(repo_path)
+        
+        # 构建 prompt：目录结构 + Issue
+        user_prompt = f"""Repository: {instance["repo"]}
+
+Directory structure:
+```
+{repo_tree}
+```
+
+Issue:
+{instance["problem_statement"]}
+
+Find the relevant files and code locations for this issue."""
+        
         # 初始消息
-        messages = [{"role": "user", "content": instance["problem_statement"]}]
+        messages = [{"role": "user", "content": user_prompt}]
         
         total_log_prob = 0.0
         
