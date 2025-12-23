@@ -420,17 +420,49 @@ def main():
     parser.add_argument("--split", type=str, default="lite", choices=["lite", "full"], help="SWE-Bench 版本")
     parser.add_argument("--max_samples", type=int, default=100, help="最大训练样本数")
     
-    # 训练
+    # 训练参数
     parser.add_argument("--num_steps", type=int, default=100, help="训练步数")
     parser.add_argument("--batch_size", type=int, default=2, help="批次大小")
     parser.add_argument("--num_rollouts", type=int, default=4, help="每个样本的 rollout 数")
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="学习率")
+    parser.add_argument("--temperature", type=float, default=0.7, help="采样温度")
+    parser.add_argument("--max_turns", type=int, default=4, help="最大对话轮数")
+    parser.add_argument("--max_parallel_calls", type=int, default=8, help="每轮最大并行工具调用数")
+    
+    # 量化设置
+    parser.add_argument("--quantization", type=str, default="4bit", 
+                        choices=["4bit", "8bit", "none"], help="量化方式")
+    parser.add_argument("--dtype", type=str, default="bf16",
+                        choices=["bf16", "fp16", "fp32"], help="计算精度")
+    
+    # LoRA 参数
+    parser.add_argument("--lora_r", type=int, default=16, help="LoRA rank")
+    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha")
+    parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout")
+    
+    # 稳定性参数
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
+    parser.add_argument("--max_traj_length", type=int, default=4096, help="最大轨迹长度（token数）")
+    parser.add_argument("--scale_by_tool_calls", action="store_true", default=True, help="按工具调用数缩放advantage")
+    parser.add_argument("--no_scale_by_tool_calls", action="store_false", dest="scale_by_tool_calls")
+    
+    # 其他
+    parser.add_argument("--seed", type=int, default=42, help="随机种子")
+    parser.add_argument("--save_every", type=int, default=50, help="每N步保存一次")
+    parser.add_argument("--debug", action="store_true", help="调试模式：打印详细信息")
     
     args = parser.parse_args()
     
     print("=" * 60)
     print("LightningGrep RL 训练")
     print("=" * 60)
+    
+    # 设置随机种子
+    import random
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     
     # 检查 GPU
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -439,13 +471,20 @@ def main():
     else:
         print("⚠️ 未检测到 GPU，训练会很慢！")
     
+    # 打印配置
+    print(f"\n配置:")
+    print(f"  量化: {args.quantization}")
+    print(f"  精度: {args.dtype}")
+    print(f"  温度: {args.temperature}")
+    print(f"  LoRA: r={args.lora_r}, alpha={args.lora_alpha}")
+    print(f"  学习率: {args.learning_rate}")
+    
     # 1. 加载数据
     print("\n[1/4] 加载 SWE-Bench 数据...")
     data = load_swebench_data(args.split)
     
     # 限制样本数
     if args.max_samples and len(data) > args.max_samples:
-        import random
         data = random.sample(data, args.max_samples)
     
     print(f"  使用 {len(data)} 条数据")
@@ -460,20 +499,45 @@ def main():
     print("\n[3/4] 加载模型...")
     tokenizer = AutoTokenizer.from_pretrained(args.sft_model, trust_remote_code=True)
     
-    # 4-bit 量化
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-    )
+    # 设置精度
+    dtype_map = {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+        "fp32": torch.float32,
+    }
+    compute_dtype = dtype_map[args.dtype]
     
-    base_model = AutoModelForCausalLM.from_pretrained(
-        args.base_model,
-        quantization_config=bnb_config,
-        device_map="auto",
-        trust_remote_code=True,
-    )
+    # 量化配置
+    if args.quantization == "4bit":
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=compute_dtype,
+            bnb_4bit_use_double_quant=True,
+        )
+        base_model = AutoModelForCausalLM.from_pretrained(
+            args.base_model,
+            quantization_config=bnb_config,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+    elif args.quantization == "8bit":
+        bnb_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+        )
+        base_model = AutoModelForCausalLM.from_pretrained(
+            args.base_model,
+            quantization_config=bnb_config,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+    else:  # none
+        base_model = AutoModelForCausalLM.from_pretrained(
+            args.base_model,
+            torch_dtype=compute_dtype,
+            device_map="auto",
+            trust_remote_code=True,
+        )
     
     # 加载 SFT LoRA 并合并
     model = PeftModel.from_pretrained(base_model, args.sft_model)
@@ -481,9 +545,9 @@ def main():
     
     # 创建新的 LoRA 用于 RL
     lora_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        lora_dropout=0.05,
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
@@ -499,14 +563,27 @@ def main():
         repo_manager=repo_manager,
         learning_rate=args.learning_rate,
         num_rollouts=args.num_rollouts,
+        max_turns=args.max_turns,
+        temperature=args.temperature,
     )
+    
+    # 调试模式
+    if args.debug:
+        trainer.debug = True
     
     trainer.train(
         train_data=data,
         num_steps=args.num_steps,
         batch_size=args.batch_size,
         output_dir=args.output_dir,
+        save_every=args.save_every,
     )
+    
+    # 打印完成信息
+    print("\n" + "=" * 60)
+    print("训练完成！")
+    print(f"模型保存到: {args.output_dir}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
