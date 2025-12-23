@@ -23,7 +23,7 @@ python scripts/run_rl.py \
     --max_parallel_calls 8 \
     --temperature 0.7 \
     --learning_rate 5e-6 \
-    --quantization none \
+    --quantization 4bit \
     --dtype bf16 \
     --lora_r 16 \
     --lora_alpha 32 \
