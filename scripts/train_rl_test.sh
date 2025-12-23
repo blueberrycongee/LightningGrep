@@ -28,7 +28,7 @@ python scripts/run_rl.py \
     --lora_r 16 \
     --lora_alpha 32 \
     --grad_clip 1.0 \
-    --max_traj_length 32768 \
+    --max_traj_length 16384 \
     --debug \
     --save_every 20
 
