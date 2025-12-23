@@ -669,14 +669,16 @@ Find the relevant files and code locations. After exploring with tools, provide 
             
             # 生成（不计算梯度）
             # Qwen3 会先 <think> 思考，需要足够的 token 空间
+            # 不限制长度，由 max_traj_length 控制总轨迹长度
             with torch.no_grad():
                 outputs = self.model.generate(
                     **inputs,
-                    max_new_tokens=2048,  # 增加以容纳思考 + 工具调用
+                    max_new_tokens=8192,  # 足够容纳思考 + 工具调用
                     temperature=self.temperature,
                     do_sample=True,
                     pad_token_id=self.tokenizer.pad_token_id,
                     return_dict_in_generate=True,
+                    eos_token_id=self.tokenizer.eos_token_id,
                 )
             
             generated_ids = outputs.sequences[0][input_ids.shape[1]:]
@@ -1090,7 +1092,7 @@ def main():
     
     # 稳定性参数
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
-    parser.add_argument("--max_traj_length", type=int, default=4096, help="最大轨迹长度（token数）")
+    parser.add_argument("--max_traj_length", type=int, default=32768, help="最大轨迹长度（token数）")
     parser.add_argument("--scale_by_tool_calls", action="store_true", default=True, help="按工具调用数缩放advantage")
     parser.add_argument("--no_scale_by_tool_calls", action="store_false", dest="scale_by_tool_calls")
     
