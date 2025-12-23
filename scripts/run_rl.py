@@ -185,14 +185,14 @@ class RepoManager:
         import time
         import re
         
-        # GitHub 镜像列表（国内优先）
+        # GitHub 镜像列表（原始优先，配合学术加速使用）
         mirrors = [
-            f"https://ghproxy.com/https://github.com/{repo}.git",  # ghproxy 镜像（默认）
+            f"https://github.com/{repo}.git",  # 原始 GitHub（配合学术加速）
+            f"https://ghproxy.com/https://github.com/{repo}.git",  # ghproxy 镜像
             f"https://gitclone.com/github.com/{repo}.git",  # gitclone 镜像
-            f"https://github.com/{repo}.git",  # 原始 GitHub（最后尝试）
         ]
         
-        mirror_names = ["ghproxy镜像", "gitclone镜像", "GitHub原始"]
+        mirror_names = ["GitHub原始", "ghproxy镜像", "gitclone镜像"]
         
         print(f"  克隆仓库: {repo}...")
         
@@ -738,6 +738,10 @@ Find the relevant files and code locations. After exploring with tools, provide 
             # Qwen3 会先 <think> 思考，需要足够的 token 空间
             # 不限制长度，由 max_traj_length 控制总轨迹长度
             with torch.no_grad():
+                # 获取 EOS token ID，但允许模型生成更长的输出
+                # 使用 </tool_calls> 作为停止条件更合理
+                stop_token_ids = self.tokenizer.encode("</tool_calls>", add_special_tokens=False)
+                
                 outputs = self.model.generate(
                     **inputs,
                     max_new_tokens=8192,  # 足够容纳思考 + 工具调用
@@ -745,7 +749,7 @@ Find the relevant files and code locations. After exploring with tools, provide 
                     do_sample=True,
                     pad_token_id=self.tokenizer.pad_token_id,
                     return_dict_in_generate=True,
-                    eos_token_id=self.tokenizer.eos_token_id,
+                    # 不使用 eos_token_id，让模型生成完整的工具调用
                 )
             
             generated_ids = outputs.sequences[0][input_ids.shape[1]:]
@@ -834,15 +838,17 @@ Find the relevant files and code locations. After exploring with tools, provide 
                     final_answer = answer  # 取最后一个有效答案
         
         # 计算 reward（博客: weighted F1, β=0.5）
+        # 设计：没有提交答案比提交错误答案更差，鼓励模型至少尝试
         if format_error:
-            reward = 0.0
+            reward = -0.2  # 格式错误，严重惩罚
         elif final_answer:
             # 有 <answer> 格式，使用它
-            reward = compute_answer_reward(final_answer, ground_truth_files, ground_truth_lines, beta=0.5)
+            raw_reward = compute_answer_reward(final_answer, ground_truth_files, ground_truth_lines, beta=0.5)
+            # 即使答案错误(raw_reward=0)，也比不提交好(reward=0 > -0.1)
+            reward = raw_reward
         else:
-            # 没有 <answer>，使用隐式收集的结果（兼容模式）
-            # 这样模型可以逐渐学习
-            reward = env.compute_reward(ground_truth_files, ground_truth_lines, beta=0.5, use_submission=False)
+            # 没有 <answer>，惩罚但比格式错误轻
+            reward = -0.1  # 鼓励模型提交答案
         
         # 注意：log_prob 在 train_step 中计算，这里只保存 turn_data
         # 这样确保在 train 模式下计算梯度
@@ -865,7 +871,7 @@ Find the relevant files and code locations. After exploring with tools, provide 
     
     def _parse_tool_calls(self, response: str) -> List[Dict]:
         """
-        解析工具调用（容错解析，处理未转义引号）
+        解析工具调用（容错解析，处理未转义引号和截断输出）
         """
         import re
         
@@ -874,6 +880,14 @@ Find the relevant files and code locations. After exploring with tools, provide 
         # 提取所有 <tool_calls>...</tool_calls> 内容（可能有多个）
         pattern = r'<tool_calls>\s*(.*?)\s*</tool_calls>'
         matches = re.findall(pattern, response, re.DOTALL)
+        
+        # 如果没找到完整的 tool_calls，尝试提取截断的内容
+        if not matches:
+            # 匹配 <tool_calls> 开始但可能没有结束标签的情况
+            truncated_pattern = r'<tool_calls>\s*(.*?)$'
+            truncated_matches = re.findall(truncated_pattern, response, re.DOTALL)
+            if truncated_matches:
+                matches = truncated_matches
         
         for calls_json in matches:
             calls_json = calls_json.strip()
@@ -901,19 +915,20 @@ Find the relevant files and code locations. After exploring with tools, provide 
                 pass
             
             # 方法2：容错解析 - 提取 name 和 arguments 内容
-            # 匹配: "name": "grep" 和 "arguments": "{...}"
-            call_pattern = r'"name"\s*:\s*"(\w+)"[^}]*"arguments"\s*:\s*"\{([^}]*)\}"'
+            # 匹配: "name": "grep" 和 "arguments": "{...}" (可能不完整)
+            call_pattern = r'"name"\s*:\s*"(\w+)"[^}]*"arguments"\s*:\s*"?\{([^}]*)'
             call_matches = re.findall(call_pattern, calls_json)
             
             for name, args_inner in call_matches:
-                # 解析 arguments 内容（可能未转义）
+                # 解析 arguments 内容（可能未转义或截断）
                 # 例如: "query": "pattern", "path": "src/"
                 args = {}
-                kv_pattern = r'"(\w+)"\s*:\s*"([^"]*)"'
+                # 匹配 key-value 对，支持转义和未转义的引号
+                kv_pattern = r'[\\"](\w+)[\\"]?\s*:\s*[\\"]([^"\\]*)'
                 for key, value in re.findall(kv_pattern, args_inner):
                     args[key] = value
                 
-                if name and args:
+                if name:  # 只要有工具名就算有效
                     tool_calls.append({
                         "id": f"call_{len(tool_calls)+1}",
                         "name": name,
@@ -980,7 +995,9 @@ Find the relevant files and code locations. After exploring with tools, provide 
             baselines = (total_reward - rewards) / (n - 1)
             advantages = rewards - baselines
         else:
-            advantages = rewards - rewards.mean()
+            # 只有 1 个轨迹时，直接用 reward 作为 advantage（不减 baseline）
+            # 这样即使 reward=0，也能有梯度信号（惩罚当前策略）
+            advantages = rewards  # 不减去 mean，否则变成 0
         
         # 5. 按 token 数 normalize（替代按工具调用数 scaling，更稳定）
         # 这样长轨迹和短轨迹的梯度贡献更均衡
@@ -1176,7 +1193,7 @@ def main():
     
     # 模型
     parser.add_argument("--sft_model", type=str, required=True, help="SFT 模型路径")
-    parser.add_argument("--base_model", type=str, default="Qwen/Qwen3-1.7B", help="基座模型")
+    parser.add_argument("--base_model", type=str, default="./models/Qwen/Qwen3-1.7B", help="基座模型")
     parser.add_argument("--output_dir", type=str, default="outputs/rl_v1", help="输出目录")
     
     # 数据
